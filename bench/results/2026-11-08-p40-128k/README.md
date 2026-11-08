@@ -20,7 +20,8 @@ freshly started engine.
 `long128.py` (in this folder) writes a run config, starts the engine with `strata.py runtime start --profile NAME`,
 waits for `/health`, sends one `/v1/chat/completions` request, reads the engine's own `timings.prompt_per_second`,
 and stops the engine. `STRATA_PREFILL_TIMING=1` is set for every arm, so each run also prints the per-phase GPU
-timeline.
+timeline. `config-installed.json` is the run config these arms started from (the app's own file, `api_key` removed);
+`decode-arms.py` and `prefill-arms.py` are the decode and short-prompt harnesses used earlier on the same machine.
 
 One run per arm. Four arms that differ only in settings that turned out to do nothing (k4, k5, k6, k7) read
 609.2 / 610.6 / 608.2 / 609.4 tok/s and 191,623 / 191,057 / 191,851 / 191,532 ms of GPU timeline, so the
