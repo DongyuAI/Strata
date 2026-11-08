@@ -37,6 +37,8 @@ run-to-run spread at this size is about ±0.4 %. A difference smaller than that 
 | k6 | k4 + `--prefill-pipe 3328` | 608.2 (no gain) | 209.3 s | 191,851 ms |
 | k7 | k4 + `STRATA_ARENA_PIN_GIB=auto` | 609.4 (no gain) | 208.9 s | 191,532 ms |
 | k8 | k4 + `STRATA_ARENA_PIN_GIB=24` | engine refused to start | — | — |
+| k9a | k4, on a local sm_61 build of this source | 610.5 | 208.5 s | — |
+| k9b | k9a + `STRATA_MMQ_WS=2` | 611.4 (no gain) | 208.2 s | — |
 
 k8's log: `expert cache auto: 0.00 GiB free … no VRAM is left for the expert cache` and
 `layer split, CUDA1 free memory: out of memory`. Page-locked host memory the GPU maps is charged to its WDDM shared
@@ -84,12 +86,25 @@ before the switch and 3.9 % after; a 256K read would pay about four times the k2
 - `--prefill-pipe` (`1` and `3328`): no change to `embed+steps` (19,614 / 19,923 ms against 19,781 ms) and no change
   to the total. The 19.8 s is not removed by re-chunking the hand-off on this pair.
 - `STRATA_ARENA_PIN_GIB=auto`: no change at all; `=24` does not start.
+- `STRATA_MMQ_WS=2`: no change (611.4 against 610.5 on the same build). The weight-stationary products run only on a
+  layer whose **every** expert is resident (`src/prefill/prefill.cpp`, the `all` loop over the layer's experts), and
+  this pack keeps 16,698 of 24,576 (layer, expert) pairs in VRAM, so no layer qualifies. The switch itself is now
+  reachable on cc 6.1 (a diagnostic line says so at start-up: `STRATA_MMQ_WS=2 on 2 device(s) of cc 6.x`), but the
+  residency rule is a VRAM-capacity limit, not a code one: on a pair of cards that holds every expert of a layer it
+  would still be the GP100 measurement (prompt reads 31-37 % shorter on four dies).
+
+## The build
+
+`build-sm61.bat` compiles this source for sm_61 with the CUDA 12 toolkit (the same flags as `setup.py`'s
+`build_engine`). Its engine read the same prompt at 610.5 tok/s against the released component's 609.2-610.6, so the
+rebuilt binary is a valid stand-in for the A/B above and costs nothing on its own. The released engine was restored
+afterwards; the numbers in the table are the released one except k9a/k9b.
 
 ## Not measured here
 
-- `STRATA_MMQ_WS=2` (weight-stationary expert products, extended to cc 6.1 in `src/prefill/moe_ws.cu`): the kernels
-  are in the released binary for sm_61 but the run-time gate refused anything but cc 6.0, and the extension needs a
-  build. No number is claimed.
+- `STRATA_SELECT_TWO_PASS=1` (a cheap first pass, the blocks near the cut-off scored again exactly): the shipped form
+  needs TF32 tensor cores (sm_80+). After `STRATA_SELECT_SIMT=1` the phase it would shorten is 3.9 % of the read, so a
+  DP4A version for sm_61 was not written.
 - Decode: these arms read prompts; decode throughput was not the subject and is not reported.
 - Quality: `STRATA_SELECT_SIMT=1` is not bitwise the warp scorer, so its effect on answers was not measured here.
   `STRATA_PATTN_SM60=1` is bit for bit.

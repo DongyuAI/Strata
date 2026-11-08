@@ -67,8 +67,17 @@ int mode() {
         for (int d = 0; d < n; ++d) {
             cudaDeviceProp p{};
             if (cudaGetDeviceProperties(&p, d) != cudaSuccess) { cudaGetLastError(); return 0; }
-            if (p.major != 6 || (p.minor != 0 && !(v == 2 && p.minor == 1))) { cudaGetLastError(); return 0; }
+            if (p.major != 6 || (p.minor != 0 && !(v == 2 && p.minor == 1))) {
+                std::fprintf(stderr, "strata prefill: STRATA_MMQ_WS=%d but device %d is cc %d.%d (needs 6.0, or 6.1 with =2)\n",
+                             v, d, p.major, p.minor);
+                std::fflush(stderr);
+                cudaGetLastError();
+                return 0;
+            }
         }
+        std::fprintf(stderr, "strata prefill: STRATA_MMQ_WS=%d on %d device(s) of cc 6.x: the weight-stationary expert "
+                             "products may run on a layer whose experts are all resident\n", v, n);
+        std::fflush(stderr);
         return 1;
     }();
     return m;
