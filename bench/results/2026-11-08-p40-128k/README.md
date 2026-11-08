@@ -41,6 +41,19 @@ run-to-run spread at this size is about ±0.4 %. A difference smaller than that 
 | k9a | k4, on a local sm_61 build of this source | 610.5 | 208.5 s | — |
 | k9b | k9a + `STRATA_MMQ_WS=2` | 611.4 (no gain) | 208.2 s | — |
 | k10 | k4 + `STRATA_HANDOFF_PIPE=4` | 609.9 (no gain) | 208.7 s | — |
+| k12 | k4 + `--max-context 524288`, 512,032-token prompt | **585.7** | 875.0 s | 854,028 ms |
+
+k12 is the same two cards and the same settings as k4, only four times the prompt: 512,032 tokens at 585.7 tok/s
+against 127,042 at 609.2, so a four-times-longer prompt costs 3.9 % of throughput. Memory is where it goes: the KV
+cache's RAM part grows 0.77 → 3.09 GiB and the expert cache falls from 16,698 to 13,856 slots (6,499 + 7,357), with
+557 MiB of VRAM free at load. `qsa select` grows 7,522 → 69,424 ms (8.1 % of the read); without `STRATA_SELECT_SIMT`
+that phase would be about 3.9 times larger at this length, so the switch is worth more the longer the prompt is.
+
+The model is trained to 262,144 positions. At `--max-context 524288` the engine needs YaRN:
+`--rope-scaling yarn --rope-scale 2` (the log then says `rope scaling yarn, factor 2 (freq_scale 0.5, base 1e+07,
+mscale 1.069315), --max-context 524288 against a trained context of 262144`). k12 ran without it (speed does not
+depend on the scaling) and k13 checked that the pair of flags starts.
+
 
 k8's log: `expert cache auto: 0.00 GiB free … no VRAM is left for the expert cache` and
 `layer split, CUDA1 free memory: out of memory`. Page-locked host memory the GPU maps is charged to its WDDM shared
