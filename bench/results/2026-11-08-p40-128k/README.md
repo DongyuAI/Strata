@@ -40,6 +40,7 @@ run-to-run spread at this size is about ±0.4 %. A difference smaller than that 
 | k8 | k4 + `STRATA_ARENA_PIN_GIB=24` | engine refused to start | — | — |
 | k9a | k4, on a local sm_61 build of this source | 610.5 | 208.5 s | — |
 | k9b | k9a + `STRATA_MMQ_WS=2` | 611.4 (no gain) | 208.2 s | — |
+| k10 | k4 + `STRATA_HANDOFF_PIPE=4` | 609.9 (no gain) | 208.7 s | — |
 
 k8's log: `expert cache auto: 0.00 GiB free … no VRAM is left for the expert cache` and
 `layer split, CUDA1 free memory: out of memory`. Page-locked host memory the GPU maps is charged to its WDDM shared
@@ -86,6 +87,10 @@ before the switch and 3.9 % after; a 256K read would pay about four times the k2
 
 - `--prefill-pipe` (`1` and `3328`): no change to `embed+steps` (19,614 / 19,923 ms against 19,781 ms) and no change
   to the total. The 19.8 s is not removed by re-chunking the hand-off on this pair.
+- `STRATA_HANDOFF_PIPE=4` (the hand-off in four row pieces, on its own worker thread): 609.9 tok/s, `embed+steps`
+  still 19.6 s. Neither form of the hand-off knob moves the phase, so its 1.2 s per chunk is not the copy itself but
+  the host's wait at the chunk boundary (the state save and the error check after the chunk's work). Changing that is
+  a change to the chunk-boundary code, not a setting.
 - `STRATA_ARENA_PIN_GIB=auto`: no change at all; `=24` does not start.
 - `STRATA_MMQ_WS=2`: no change (611.4 against 610.5 on the same build). The weight-stationary products run only on a
   layer whose **every** expert is resident (`src/prefill/prefill.cpp`, the `all` loop over the layer's experts), and
