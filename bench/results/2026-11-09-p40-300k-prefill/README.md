@@ -104,6 +104,54 @@ the FMA order are unchanged, so the result is bit for bit the staged version. Th
 than the recurrence (table above), so it stays opt-in; the fix is what makes it runnable at all on
 Pascal.
 
+## Is the installed config already the fastest one? (config arms)
+
+The installed `F:\Strata\install\strata-iq3_s.json` is not a guess: its arguments are the same ones
+`s300k`/`base300` ran (DFlash2 injected by `strata_control.drafting.apply` as `--draft dflash2 …
+--spec 6 --draft-conf 0.35`, and the config's own `--spec 4` is dropped there), so 300K prefill on the
+installed path is the 605 tok/s baseline. The control repeats 605.6 / 605.9 / 604.9 / 604.2 across four
+starts, ±0.14 %, so only a change above ~0.5 % is worth keeping.
+
+The one argument that was never measured is the context window. It was `--max-context 524288
+--rope-scaling yarn --rope-scale 2` — 2x the trained 262,144, with 3.09 GiB of K/V in pinned RAM. Three
+windows, same prompt, same 128 generated tokens:
+
+| `--max-context` / `--rope-scale` | pinned K/V | prefill tok/s | decode tok/s | largest prompt it holds |
+| --- | ---: | ---: | ---: | ---: |
+| 524288 / 2.0 (what was installed) | 3.09 GiB | 604.2 | 31.3 | 512K |
+| 393216 / 1.5 | 2.32 GiB | 607.6 | 31.6 | 384K |
+| 327680 / 1.25 | 1.93 GiB | 609.9 | 33.5 | 320K |
+
+Monotonic and consistent with the mechanism: the smaller window pins less host RAM, and the phases that
+touch it move together (`wait copy` −65 ms/chunk, `gdn` −30, `qsa select` −16 on the 327,680 run). All
+three keep `ctx / scale = 262144`, so none of them extrapolates past the trained window — the 2.0 factor
+was not buying quality at 300K, only reach. **Set to 393216 / 1.5**: +0.56 % and it still holds every
+tier that was measured up to 393K. 327680 / 1.25 is a further +0.4 % if the prompts never pass 320K;
+524288 is only needed for the 450K/512K tiers.
+
+Two more config arms, both neutral:
+
+| arm | change | prefill tok/s | decode tok/s |
+| --- | --- | ---: | ---: |
+| `vr1g` | `--vram-reserve-mib 1024` instead of 512 | 603.8 (64 tok), 607.3 (in the 4-flag combo, 128 tok) | 34.2 / 29.5 |
+| `pw11` | `--pool-workers 11` (the engine's own plan for 8P+4E; the config had 10) | 605.5 | 32.9 |
+
+Decode is not resolvable at this sample size: the installed config measured 32.4 and 31.3 tok/s on two
+starts (64 and 128 tokens), and `vr1g` measured 34.2 and 29.5 on the same two lengths — a ±5 % spread
+that swallows every flag's effect. Nothing here claims a decode change.
+
+`--vram-reserve-mib 512` does leave the engine below its own threshold, and it says so every start:
+
+```
+strata serve: 557 MiB of VRAM free with everything loaded
+strata serve: CUDA1: 471 MiB of VRAM free with everything loaded - LOW ...
+strata serve: WARNING: only 557 MiB of VRAM free at the start of this request (below 1024 MiB) ...
+```
+
+1024 MiB costs 267 of 8944 expert slots and 0.2–0.4 % prefill, and removes the warning; 512 keeps the
+faster number. No run in this folder paged or stalled at 512 (30.4 tok/s decode at 300K, window graphs
+captured every time), so 512 stays and the warning stays with it — it is a warning, not a measurement.
+
 ## What the community has, and what reaches Pascal
 
 - **llama.cpp is the only serious reference for Pascal CUDA, and this engine already vendors its
