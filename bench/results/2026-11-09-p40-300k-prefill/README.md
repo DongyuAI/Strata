@@ -49,6 +49,7 @@ like 2.8 %. The per-chunk medians above are the ones that add up (13,082 against
 | warp2b | `STRATA_GDN_REC_WARP=2` (the chain-split recurrence) | 605.2 | −0.1 % |
 | warp1 | `STRATA_GDN_REC_WARP=1` (the sync-free warp recurrence) | none — hangs | — |
 | direct1 | `STRATA_MMQ_DIRECT=1` (resident experts read in their cache slot) | not applicable | — |
+| gsort | `STRATA_MMQ_GROUP_SORT=1` (full MMQ groups taken in row-count order) | 607.2 | +0.2 % |
 
 base300 against s300k is the control: the same settings measured twice, 605.6 and 605.9, so the bar for a
 gain on this prompt is about ±0.5 %.
@@ -102,3 +103,26 @@ global tile — a warp's lanes share `t` and `i`, so each read is one broadcast 
 the FMA order are unchanged, so the result is bit for bit the staged version. The path is still slower
 than the recurrence (table above), so it stays opt-in; the fix is what makes it runnable at all on
 Pascal.
+
+## What the community has, and what reaches Pascal
+
+- **llama.cpp is the only serious reference for Pascal CUDA, and this engine already vendors its
+  kernels.** `src/prefill/mmq_kq_lib.cu` includes llama.cpp's `mmq.cuh`; for IQ3_S that file selects
+  `MMQ_DP4A_TXS_Q8_0` (`mmq.cuh:418`), i.e. the int8 DP4A tile, and `ggml_cuda_dp4a` is chosen from
+  `GGML_CUDA_CC_DP4A = 610` (`common.cuh:51`). The released engine is built for archs
+  60/61/70/75/80/86/89 (`BUILD.json`), so the expert GEMM (16.3 % of a chunk) already runs the
+  community's int8 DP4A path on this P40. A new int8 expert GEMM would duplicate it.
+- **The community's DP4A work is decode, not prefill.** llama.cpp PR #8215 ("CUDA: refactor and
+  optimize IQ MMVQ") is about MMVQ — matrix times vector, where int8 halves the bytes read. Prefill is
+  compute-bound, and llama.cpp has no int8 GEMM for prompt batches beyond MMQ itself.
+- **The fast GDN kernels need Hopper.** Qwen's FlashQLA (TileLang) reports 2-3x on chunked GDN prefill
+  against the FLA Triton kernels, but its requirements are SM90, CUDA 12.8 and PyTorch 2.8; cuLA
+  (CuTe/CUTLASS) targets sm_80+. Neither runs on sm_61.
+- **DP4A cannot be applied to the recurrence that runs here.** Its per-token dot is
+  `state(float) · k(float)`; putting it on DP4A would mean re-quantizing the 128-float state on every
+  token, which costs more than the four FMAs per lane it saves. Only the chunked path has matrix
+  products (`k·k`, `q·k`) that int8 could take, and that path measured 16 % slower overall.
+- **The two-pass select cannot be moved to int8 without a new proof.** `qsa_two_pass.hpp` derives its
+  bound from TF32 operands and MMA accumulation error, and the whole point of the design is that the
+  selection is bit-identical to the exact scorer. An int8 screen needs its own bound; without one the
+  chosen blocks change, and so do the answers.
