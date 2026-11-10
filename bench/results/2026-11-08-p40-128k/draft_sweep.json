@@ -1,0 +1,109 @@
+[
+ {
+  "drafter": "dflash2",
+  "asked": 128000,
+  "source": "new",
+  "prompt_tokens": 128032,
+  "prompt_tps": 605.1,
+  "decode_tps": 31.9,
+  "generated": 256,
+  "wall_s": 219.7,
+  "drafts": "135/212",
+  "acceptance": 63.7,
+  "loaded": [
+   "serve: DFlash2 drafter on (F:\\LLMs\\dflash2\\qwen3.8-flash-next-dflash2.q4_0.pack, graphs ca"
+  ]
+ },
+ {
+  "drafter": "mtp",
+  "asked": 128000,
+  "source": "new",
+  "prompt_tokens": 128032,
+  "prompt_tps": 596.4,
+  "decode_tps": 32.7,
+  "generated": 256,
+  "wall_s": 222.6,
+  "drafts": "122/164",
+  "acceptance": 74.4,
+  "loaded": [
+   "mtp: draft layer loaded, 836 MiB of VRAM (experts 675, dense 111), files read in 0.78 s (1"
+  ]
+ },
+ {
+  "drafter": "dflash2",
+  "asked": 192000,
+  "prompt_tokens": 192052,
+  "prompt_tps": 611.2,
+  "decode_tps": 32.4,
+  "wall_s": 322.3,
+  "drafts": "138/197",
+  "acceptance": 70.1,
+  "source": "sweep.json"
+ },
+ {
+  "drafter": "dflash2",
+  "asked": 200000,
+  "prompt_tokens": 200032,
+  "prompt_tps": 606.5,
+  "decode_tps": 31.3,
+  "wall_s": 338.1,
+  "drafts": "139/218",
+  "acceptance": 63.8,
+  "source": "sweep.json"
+ },
+ {
+  "drafter": "dflash2",
+  "asked": 256000,
+  "prompt_tokens": 256042,
+  "prompt_tps": 604.5,
+  "decode_tps": 30.1,
+  "wall_s": 432.3,
+  "drafts": "140/243",
+  "acceptance": 57.6,
+  "source": "sweep.json"
+ },
+ {
+  "drafter": "dflash2",
+  "asked": 300000,
+  "prompt_tokens": 300052,
+  "prompt_tps": 605.6,
+  "decode_tps": 30.4,
+  "wall_s": 504.1,
+  "drafts": "134/209",
+  "acceptance": 64.1,
+  "source": "sweep.json"
+ },
+ {
+  "drafter": "dflash2",
+  "asked": 350000,
+  "prompt_tokens": 350032,
+  "prompt_tps": 602.3,
+  "decode_tps": 29.8,
+  "wall_s": 590.0,
+  "drafts": "135/227",
+  "acceptance": 59.5,
+  "source": "sweep.json"
+ },
+ {
+  "drafter": "dflash2",
+  "asked": 393000,
+  "prompt_tokens": 393052,
+  "prompt_tps": 598.1,
+  "decode_tps": 29.0,
+  "wall_s": 666.3,
+  "drafts": "135/202",
+  "acceptance": 66.8,
+  "source": "sweep.json"
+ },
+ {
+  "drafter": "dflash2",
+  "asked": 450000,
+  "prompt_tokens": 450052,
+  "prompt_tps": 592.9,
+  "decode_tps": 30.2,
+  "wall_s": 767.9,
+  "drafts": "138/218",
+  "acceptance": 63.3,
+  "source": "sweep.json"
+ }
+]
