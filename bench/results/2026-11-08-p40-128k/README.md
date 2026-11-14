@@ -2,7 +2,8 @@
 
 A single cold 127,042-token prompt read on a two-card layer split, used to find where a long prompt's time goes on
 compute capability 6.1 and which switches shorten it. Engine 0.1.58, Windows 11, one request per arm, each arm on a
-freshly started engine.
+freshly started engine. The decode side is in [PIPELINE.md](PIPELINE.md): where a decode window's time goes at this
+prompt, and a two-round A/B of `--pipeline-windows 2` (30.3 → 34.3 and 30.9 → 33.2 tok/s).
 
 ## Machine and configuration
 
@@ -124,6 +125,6 @@ afterwards; the numbers in the table are the released one except k9a/k9b.
 - `STRATA_SELECT_TWO_PASS=1` (a cheap first pass, the blocks near the cut-off scored again exactly): the shipped form
   needs TF32 tensor cores (sm_80+). After `STRATA_SELECT_SIMT=1` the phase it would shorten is 3.9 % of the read, so a
   DP4A version for sm_61 was not written.
-- Decode: these arms read prompts; decode throughput was not the subject and is not reported.
+- Decode: these arms read prompts; the decode side is in [PIPELINE.md](PIPELINE.md).
 - Quality: `STRATA_SELECT_SIMT=1` is not bitwise the warp scorer, so its effect on answers was not measured here.
   `STRATA_PATTN_SM60=1` is bit for bit.

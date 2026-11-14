@@ -193,6 +193,12 @@ tokens. The tokens are the serial loop's, up to CPU rounding.
   recurrent state (about 3 MiB per GDN layer it runs).
 - **Config:** `"args": [ ..., "--pipeline-windows", "2" ]` with `"layer_split": "20"`.
 
+**Measured on:** 2× Tesla P40 (sm_61), Windows 11, Qwen3.8-Flash-Next IQ3_S at a 127,042-token prompt with the MTP:
+decode 30.3 → 34.3 tok/s (+13.2 %) with the baseline first, and 30.9 → 33.2 (+7.4 %) with the order reversed. Prefill
+stayed at 615 against 617 tok/s. The first card's expert cache fell from 6,551 to 6,441 slots and its hit rate from
+97.4 % to 97.3 %. A decode window there is 66.2 ms of GPU work between two cards that run one after the other, so
+this switch is the one that moves it; the profile is in `bench/results/2026-11-08-p40-128k/PIPELINE.md`.
+
 `--remote-expert-opt` does something only with a helper cache; on a plain layer split it is inert.
 The `STRATA_PIPELINE_*` tuning and test variables are read only with `STRATA_PIPELINE_DEBUG=1`.
 
