@@ -90,15 +90,53 @@ back.
 
 ## Limits
 
-- One prompt shape, 96 tokens, 127K. The 8K–300K grid in `DRAFTERS.md` was measured with the MTP
-  without the pipeline, so its MTP column now understates this machine's best decode.
+- One prompt shape, 96 tokens. The A/B is at 127K; the 350K run is the profile only, no pipeline arm.
+- The 8K–300K grid in `DRAFTERS.md` was measured with the MTP without the pipeline, so its MTP column
+  now understates this machine's best decode.
 - Acceptance depends on content; the speculative/rollback split will move with it, and so will the gain.
 - DFlash2 cannot use the pipeline: it drafts from the finished window's taps on every stage. The
   pipeline needs `--mtp`, `--serve`, `--spec 2` or more, and a layer split on exactly two cards.
-- 192K and above were not re-run.
+
+## The same profile at 350K
+
+One more run of the DFlash2 arm (still no pipeline), to see which stage is the one that grows with the
+prompt: 350,032 tokens, 96 greedy tokens, prefill 624.6 tok/s (560.4 s), decode 30.7 tok/s (3,122 ms),
+37 windows, 2.59 tokens per window, 84.38 ms per window, 33.24 + 36.89 ms of GPU stages.
+
+| per window, both cards | 127K | 350K |
+| --- | ---: | ---: |
+| expert matmuls | 13.98 | 14.49 |
+| hyper-connections | 12.01 | 11.82 |
+| projections | 12.51 | 12.32 |
+| router and shared experts | 6.11 | 6.18 |
+| GDN conv / a-b / z / recurrence | 5.12 | 5.06 |
+| LM head | 3.41 | 3.32 |
+| **QSA scores and top-k** | **2.97** | **7.04** |
+| KV index, norm-rope, append, resolve | 2.52 | 2.85 |
+| attention itself | 1.43 | 1.48 |
+| waits and copies | 6.12 | 5.57 |
+| **total** | **66.2** | **70.1** |
+
+The window is 3.9 ms longer and block selection is +4.07 ms of it. Everything that reads K/V is flat:
+attention 1.43 → 1.48 ms, the whole KV path +0.33 ms on a prompt 2.75 times longer. The selection
+scores every block of the prompt on every step, so its cost follows the context (2.97 × 2.75 ≈ 8.2
+against the measured 7.04), while the selected cells it then reads cost the same at any length.
+
+Decode was faster here than at 127K (30.7 against 29.7 tok/s) because acceptance rose: 2.59 tokens per
+window against 2.40, and 37 windows instead of 40. The 256-token DFlash2 cells in `DRAFTERS.md` read
+29.8 tok/s at 350K, so the length of the answer, not the length of the prompt, decides that number.
+
+Two consequences:
+
+- Raising `--kv-resident` is not a decode lever on this machine: the KV path costs 2.85 ms per window
+  at 350K and would save a fraction of that.
+- Block selection is the only part of decode that grows with the prompt, 4.5 % of the GPU time at 127K
+  and 10 % at 350K. If decode at 1M matters, that is the kernel to make cheaper; extrapolated
+  linearly it would be about 20 ms per window there, which was not measured.
 
 ## Reproduce
 
-`F:\tmp-strata-bench\decode_prof.py` is the profile; `pipeline_ab.py` runs the two arms in the order
-above and `pipeline_ab2.py` with the order reversed. Both reuse `long128.py` for the config, the
-start, the request and the stop.
+`F:\tmp-strata-bench\decode_prof.py` is the 127K profile and `decode_prof350.py` the 350K one (it takes
+`--pipeline-windows` out of the config so both profile the same arm); `pipeline_ab.py` runs the two
+arms in the order above and `pipeline_ab2.py` with the order reversed. All reuse `long128.py` for the
+config, the start, the request and the stop.
