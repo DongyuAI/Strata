@@ -207,7 +207,7 @@ __global__ void k_swiglu(const float* g, const float* u, float* h, int64_t n) {
 }
 /// y[t][o] = W[o] . x[t] for f32 W [n_out][n_in], n_in a multiple of 128: one warp per row, float4 loads, 8 rows per
 /// block (grid (ceil(n_out / 8), T)).
-__global__ void k_gemv_f32(const float* W, const float* x, float* y, int n_in, int n_out) {
+__global__ void k_gemv_f32(const float* __restrict__ W, const float* __restrict__ x, float* y, int n_in, int n_out) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int o = blockIdx.x * 8 + warp;
     if (o >= n_out) return;
@@ -220,6 +220,26 @@ __global__ void k_gemv_f32(const float* W, const float* x, float* y, int n_in, i
     }
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
     if (lane == 0) y[(size_t) blockIdx.y * n_out + o] = acc;
+}
+/// The same dot over one K range [k0, k0 + kz) only, into a split-K partial (grid (ceil(n_out / 8), T, splits)).
+/// A matrix of a few hundred rows gives the card too few blocks to fill its memory pipeline (the router's 257 rows
+/// are 33 blocks: 36 GB/s measured); splitting K multiplies the blocks and the loads in flight, and the partials are
+/// summed in a fixed order afterwards.
+__global__ void k_gemv_f32_split(const float* __restrict__ W, const float* __restrict__ x, float* y, int n_in, int n_out,
+                                 int k0, int kz, int ld) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int o = blockIdx.x * 8 + warp;
+    if (o >= n_out) return;
+    const int i0 = k0 / 4, i1 = min(n_in / 4, (k0 + kz) / 4);
+    const float4* wr = (const float4*) (W + (size_t) o * n_in);
+    const float4* xr = (const float4*) (x + (size_t) blockIdx.y * n_in);
+    float acc = 0.f;
+    for (int i = i0 + lane; i < i1; i += 32) {
+        const float4 a = wr[i], b = xr[i];
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+    if (lane == 0) y[((size_t) blockIdx.z * gridDim.y + blockIdx.y) * ld + o] = acc;
 }
 unsigned rows8(int n) { return (unsigned) ((n + 7) / 8); }
 /// GDN gate / beta in place for T rows of HV: alpha -> softplus(alpha + dt) * ssm_a, beta -> sigmoid(beta).
@@ -2017,6 +2037,10 @@ struct Engine {
             }
         }
         std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
+        if (const char* lg = std::getenv("STRATA_Q36_LOG")) {   // a host that swallows the engine's stderr keeps a copy here
+            if (std::FILE* f = std::freopen(lg, "a", stderr)) (void) f;
+            std::fprintf(stderr, "strata-q36: engine started, device %d\n", dev);
+        }
         {
             std::string gerr;
             int64_t big = 0;
@@ -2029,9 +2053,44 @@ struct Engine {
                 take(m->mtp);
                 big = std::max<int64_t>(big, (int64_t) m->eh_proj.n_in * m->eh_proj.n_out);
             }
+            // STRATA_Q8_SM60=1: the dense Q8_0 decode products on the Pascal packed GEMV (q8_sm60.cuh: 220-270 GB/s on a
+            // GP100 against ~137 for the generic kernel).  The kernel reads a packed copy, so every matrix the decode
+            // touches is packed here, once; without the switch this loop does nothing and the weights are read as they are.
+            {
+                int packed = 0;
+                auto pack = [&](const Layer& L) {
+                    for (const Mat* w : {&L.qkv, &L.zg, &L.ssm_out, &L.wq, &L.wk, &L.wv, &L.wo, &L.sh_gate, &L.sh_up, &L.sh_down})
+                        if (w->type == 8 && w->d && K::native_q8_0_sm60_pack_quiet(w->d, w->n_in, w->n_out, "dense")) ++packed;
+                };
+                for (const Layer& L : m->layers) pack(L);
+                if (m->has_mtp) pack(m->mtp);
+                if (packed) std::fprintf(stderr, "strata-q36: %d dense Q8_0 matrices on the Pascal packed decode GEMV\n", packed);
+            }
             if (!gemm.init(st, big, gerr)) {
                 std::fprintf(stderr, "strata-q36: prompt GEMM: %s\n", gerr.c_str());
                 std::exit(1);
+            }
+        }
+        // STRATA_Q36_OCC: what the decode kernels' occupancy is, and whether the largest L1/shared split changes it
+        // (the attention partitions hold 22 KB of shared memory a block).  Diagnostic only: off, nothing is set.
+        if (std::getenv("STRATA_Q36_OCC")) {
+            cudaFuncSetAttribute((const void*) k_attn_part_q8_tile, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute((const void*) k_attn_part_q8_tile_rows<4>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute((const void*) k_attn_part_q8, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            struct { const char* n; const void* f; } ks[] = {{"attn_tile", (const void*) k_attn_part_q8_tile},
+                                                             {"attn_tile_rows", (const void*) k_attn_part_q8_tile_rows<4>},
+                                                             {"attn_q8", (const void*) k_attn_part_q8},
+                                                             {"add_rms_q", (const void*) q36k::k_add_rms_q},
+                                                             {"argmax", (const void*) k_argmax}};
+            for (auto& k : ks) {
+                int nb = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k.f, 256, 0);
+                cudaFuncAttributes a{};
+                cudaFuncGetAttributes(&a, k.f);
+                std::fprintf(stderr, "OCC %-14s blocks/SM %d  regs %d  smem %zu\n", k.n, nb, a.numRegs, a.sharedSizeBytes);
             }
         }
         CK(cudaMalloc(&escr, K::native_expert_scratch_bytes((int64_t) (T * Kp), (int64_t) FF)));
@@ -2178,7 +2237,21 @@ struct Engine {
     /// y [T][n_out] = W [n_out][n_in] (f32) x [T][n_in]: a decode batch on the warp-per-row kernel, a prompt chunk on
     /// cuBLAS's FP32 GEMM (the router and the GDN alpha / beta stay in FP32, as llama.cpp keeps them).
     void f32mm(const float* W, const float* xin, float* out, int n_in, int n_out, int T) {
+        static const bool splitk_dec = std::getenv("STRATA_Q36_ROUTER_SPLITK") != nullptr;   // A/B: the decode split-K
         if (T <= kGemmT) {
+            // a narrow matrix (the router's 257 rows: 33 blocks) cannot fill the card's memory pipeline on its own;
+            // splitting K to about 128 blocks measured 36 -> 170 GB/s on the router's shape
+            const int gx = (int) rows8(n_out);
+            if (splitk_dec && gx * T < 96 && n_in % 4 == 0 && n_in >= 512) {
+                const int splits = std::min(kSplitK, std::max(2, 128 / (gx * T)));
+                const int kz = (n_in / splits + 3) / 4 * 4;
+                const int ns = (n_in + kz - 1) / kz;
+                if (ns > 1) {
+                    k_gemv_f32_split<<<dim3(gx, T, ns), kThreads, 0, st>>>(W, xin, sk_part, n_in, n_out, 0, kz, n_out);
+                    k_sum_splits<<<grid1((int64_t) T * n_out), kThreads, 0, st>>>(sk_part, out, (int64_t) T * n_out, ns);
+                    return;
+                }
+            }
             k_gemv_f32<<<dim3(rows8(n_out), T), kThreads, 0, st>>>(W, xin, out, n_in, n_out);
             return;
         }
@@ -2730,6 +2803,7 @@ struct Engine {
             mark(2);
         }
         add_rms_post(L, T);
+        mark(15);   // the post-attention norm, then the router's product + top-k (mark 3)
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
         // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
@@ -2887,7 +2961,25 @@ struct Engine {
             xsum("OUThm", bh.data(), n1);
             if (T == 1) state_dump();
         }
-        if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        if (heads > 0) {
+            // STRATA_Q36_HEAD_TIMING: the output head is outside the layer marks, and it is 417 MB of Q6_K a token
+            static const bool head_t = std::getenv("STRATA_Q36_HEAD_TIMING") != nullptr;
+            if (!head_t || graph_mode) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+            else {
+                cudaEvent_t a, b;
+                CK(cudaEventCreateWithFlags(&a, cudaEventDefault));
+                CK(cudaEventCreateWithFlags(&b, cudaEventDefault));
+                CK(cudaEventRecord(a, st));
+                head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+                CK(cudaEventRecord(b, st));
+                CK(cudaStreamSynchronize(st));
+                float v = 0.f;
+                CK(cudaEventElapsedTime(&v, a, b));
+                std::fprintf(stderr, "HEAD-TIME device%d T %d %.3f ms\n", dev, T, v);
+                CK(cudaEventDestroy(a));
+                CK(cudaEventDestroy(b));
+            }
+        }
         if (split) x_ready = false;
     }
     void state_dump() {
@@ -3345,6 +3437,15 @@ struct Engine {
                 pre += t0; a1 += t1; a2 += t2;
             }
             std::fprintf(stderr, "DECODE-PROJ %s device%d quant %.3f first %.3f rest %.3f ms\n", tag, dev, pre, a1, a2);
+            double nrm = 0, rtr = 0;
+            for (size_t l = 0; l < m->layers.size(); ++l) {
+                float t0 = 0, t1 = 0;
+                CK(cudaEventElapsedTime(&t0, pf_ev[l * kPfSlots + 2], pf_ev[l * kPfSlots + 15]));
+                CK(cudaEventElapsedTime(&t1, pf_ev[l * kPfSlots + 15], pf_ev[l * kPfSlots + 3]));
+                nrm += t0;
+                rtr += t1;
+            }
+            std::fprintf(stderr, "DECODE-ROUTER %s device%d norm %.3f matvec+topk %.3f ms\n", tag, dev, nrm, rtr);
         }
         if (prev != dev) CK(cudaSetDevice(prev));
     }
@@ -4072,9 +4173,13 @@ int64_t sp_process(Engine& B, const int32_t* toks, int64_t n, F on_chunk_) {
         }
     };
     if (n == 1) {
+        static const bool host_t = std::getenv("STRATA_Q36_HOST_TIMING") != nullptr;
+        const double h0 = host_t ? xtime() : 0.0;
         CK(cudaStreamSynchronize(B.st));
+        const double h1 = host_t ? xtime() : 0.0;
         if (xdump_on()) std::fprintf(stderr, "XTOK t %.0f B.pos %lld tok %d\n", xtime(), (long long) B.pos, toks[0]);
         sp_stage_run(B, toks, 1, B.pos, false);
+        const double h2 = host_t ? xtime() : 0.0;
         B.hpin[0] = toks[0];
         B.hpin[1] = (int32_t) B.pos;
         CK(cudaMemcpyAsync(B.tok, B.hpin, 4, cudaMemcpyHostToDevice, B.st));
@@ -4089,15 +4194,21 @@ int64_t sp_process(Engine& B, const int32_t* toks, int64_t n, F on_chunk_) {
             B.forward(1, B.pos, 1, false, false);
         }
         B.rows_deferred = false;
-        if (B.decode_profile && B.pos >= 60000) {   // the marks are recorded from 60K on only
+        if (B.decode_profile && B.pos >= 60000 && B.decode_profile_steps++ < 3) {   // the phase marks of this token
             CK(cudaStreamSynchronize(B.st));
             B.decode_report("token-tail", false);
             sp_decode_report(B);
         }
+        const double h3 = host_t ? xtime() : 0.0;
+        if (host_t) CK(cudaStreamSynchronize(B.st));   // the card's own layers only: the timing run pays the wait
+        const double h4 = host_t ? xtime() : 0.0;
         CK(cudaMemcpyAsync(B.hlast, B.hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, B.st));
         B.pos += 1;
         B.after_rows(1);
         on_chunk(1);
+        if (host_t)
+            std::fprintf(stderr, "HOST-TOK pos %lld t %.3f sync %.3f post %.3f launch %.3f gpu %.3f rest %.3f ms\n",
+                         (long long) B.pos - 1, h0, h1 - h0, h2 - h1, h3 - h2, h4 - h3, xtime() - h4);
         return 1;
     }
     S.toks = toks;
