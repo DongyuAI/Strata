@@ -541,6 +541,88 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
+__global__ void k_attn_part_q8_tile(const signed char* __restrict__ q8, const float* __restrict__ qsc,
+                                    const signed char* __restrict__ k8, const float* __restrict__ ksc,
+                                    const signed char* __restrict__ v8, const float* __restrict__ vsc,
+                                    const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale, int n_chunk,
+                                    float* pacc, float* pm, float* pl) {
+    constexpr int HD = 256, kDims = 8;
+    const int c = blockIdx.x, row = blockIdx.y;
+    const int tr = row / HKV, kvh = row % HKV, t = t0 + tr;
+    const int npos = *pos0 + t + 1, p0 = c * kChunkCells;
+    if (p0 >= npos) return;
+    __shared__ int4 Q[8][16], KV[64][17];
+    __shared__ float weights[8][64], ks[64], vs[64];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int h = kvh * (H / HKV) + warp, d0 = lane * kDims;
+    if (tid < 8 * 16) {
+        const int qh = kvh * (H / HKV) + tid / 16;
+        Q[tid / 16][tid % 16] = *reinterpret_cast<const int4*>(
+            q8 + ((size_t) t * H + qh) * HD + (tid % 16) * 16);
+    }
+    const float qs = qsc[(size_t) t * H + h];
+    float o[kDims] = {}, m = -INFINITY, l = 0.f;
+    for (int pb = p0; pb < p0 + kChunkCells; pb += 64) {
+        if (pb >= npos) break;
+        for (int i = tid; i < 64 * 16; i += 256) {
+            const int p = pb + i / 16, w = i % 16;
+            KV[i / 16][w] = p < npos && p < ctx
+                ? *reinterpret_cast<const int4*>(k8 + ((size_t) kvh * ctx + p) * HD + w * 16)
+                : make_int4(0, 0, 0, 0);
+        }
+        if (tid < 64) {
+            const int p = pb + tid;
+            ks[tid] = p < npos && p < ctx ? ksc[(size_t) kvh * ctx + p] : 0.f;
+            vs[tid] = p < npos && p < ctx ? vsc[(size_t) kvh * ctx + p] : 0.f;
+        }
+        __syncthreads();
+        int a0 = 0, a1 = 0;
+#pragma unroll
+        for (int w = 0; w < 16; ++w) {
+            const int4 q = Q[warp][w], k0 = KV[lane][w], k1 = KV[lane + 32][w];
+            a0 = __dp4a(q.x, k0.x, a0);
+            a0 = __dp4a(q.y, k0.y, a0);
+            a0 = __dp4a(q.z, k0.z, a0);
+            a0 = __dp4a(q.w, k0.w, a0);
+            a1 = __dp4a(q.x, k1.x, a1);
+            a1 = __dp4a(q.y, k1.y, a1);
+            a1 = __dp4a(q.z, k1.z, a1);
+            a1 = __dp4a(q.w, k1.w, a1);
+        }
+        const float s0 = pb + lane < npos ? (float) a0 * qs * ks[lane] * scale : -INFINITY;
+        const float s1 = pb + lane + 32 < npos ? (float) a1 * qs * ks[lane + 32] * scale : -INFINITY;
+        const float mn = fmaxf(m, warp_max(fmaxf(s0, s1)));
+        const float r = expf(m - mn), e0 = expf(s0 - mn), e1 = expf(s1 - mn);
+#pragma unroll
+        for (int j = 0; j < kDims; ++j) o[j] *= r;
+        l = l * r + (e0 + e1);
+        m = mn;
+        weights[warp][lane] = e0 * vs[lane];
+        weights[warp][lane + 32] = e1 * vs[lane + 32];
+        __syncthreads();
+        for (int i = tid; i < 64 * 16; i += 256) {
+            const int p = pb + i / 16, w = i % 16;
+            KV[i / 16][w] = p < npos && p < ctx
+                ? *reinterpret_cast<const int4*>(v8 + ((size_t) kvh * ctx + p) * HD + w * 16)
+                : make_int4(0, 0, 0, 0);
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (int p = 0; p < 64; ++p) {
+            const float w = weights[warp][p];
+            const signed char* vp = reinterpret_cast<const signed char*>(&KV[p][0]) + d0;
+#pragma unroll
+            for (int j = 0; j < kDims; ++j) o[j] = fmaf(w, (float) vp[j], o[j]);
+        }
+        __syncthreads();
+    }
+    const size_t oi = ((size_t) tr * H + h) * n_chunk + c;
+#pragma unroll
+    for (int j = 0; j < kDims; ++j) pacc[oi * HD + d0 + j] = o[j];
+    const float total = warp_sum(l);
+    if (lane == 0) { pm[oi] = m; pl[oi] = total; }
+}
+
 __device__ __forceinline__ int dp4(const int4& a, const int4& b, int s) {
     s = __dp4a(a.x, b.x, s);
     s = __dp4a(a.y, b.y, s);
@@ -1495,6 +1577,7 @@ void sp_mirror_reset(Engine& E);
 void sp_mirror_select(Engine& E, int i);
 void sp_mirror_commit(Engine& E, int n_keep);
 void sp_mirror_copy(Engine& E, int src, int dst);
+void sp_decode_report(Engine& E);
 
 struct Engine {
     const Model* m = nullptr;
@@ -1521,6 +1604,7 @@ struct Engine {
     std::vector<signed char*> k8, v8;
     std::vector<float*> ks8, vs8;
     bool kv8_on = true;
+    bool decode_tile = false;
     signed char* q8v = nullptr;   // this forward's queries as q8 rows [T][H][HD]
     float* qsc = nullptr;         // [T][H]
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
@@ -1533,6 +1617,7 @@ struct Engine {
     // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
     struct GSet {
         cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
+        cudaGraphExec_t gm_first[kVerify + 1] = {}, gc[kVerify + 1] = {};
     };
     std::vector<GSet> gsets;
     GSet& gs() { return gsets[(size_t) cur]; }
@@ -1565,12 +1650,15 @@ struct Engine {
     const float* prep_f = nullptr;   // the float rows prep() last put in x16 (dense_mmq quantizes these)
     __half* x16 = nullptr;
     bool use_graph = true;
+    bool split_graphs = false;
     bool x_ready = false;   // a later stage: x (the residual stream) and h (its normed image) were handed over
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
     // STRATA_Q36_PREFILL_TIMING: prompt phases (input projections, attention / GDN core, router+host round trip, expert
     // product, shared expert, combine) timed with events recorded on the engine's stream; the sums print per chunk.  Off
     // by default (no events).  pf_core splits the core's sum into GDN layers and full-attention layers.
     bool pf_on = false;
+    bool decode_profile = false;
+    int decode_profile_steps = 0;
     static constexpr int kPfSlots = 16;   // marks 0-6 phases, 7-8 a GDN layer's core, 12-14 an attention layer's slices
     std::vector<cudaEvent_t> pf_ev;
     double pf_ms[6] = {};
@@ -1862,6 +1950,9 @@ struct Engine {
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
         if (kv8_on) {
+            if (const char* e = std::getenv("STRATA_Q36_DECODE_TILE"))
+                decode_tile = g.n_head == 8 * g.n_head_kv && std::atoi(e) != 0;
+            if (decode_tile) std::fprintf(stderr, "strata-q36: tiled q8 decode attention with float weights\n");
             q8v = dalloc_t<signed char>(T * (size_t) g.n_head * g.head_dim);
             qsc = dalloc(T * (size_t) g.n_head);
             if (const char* e = std::getenv("STRATA_Q36_PRE_I8"))
@@ -1945,8 +2036,9 @@ struct Engine {
         d_delta = dalloc_t<int32_t>(1);
         cur = 0;
         load_cur();
-        if (std::getenv("STRATA_Q36_PREFILL_TIMING") != nullptr) {
-            pf_on = true;
+        pf_on = std::getenv("STRATA_Q36_PREFILL_TIMING") != nullptr;
+        decode_profile = std::getenv("STRATA_Q36_DECODE_PROFILE") != nullptr;
+        if (pf_on || decode_profile) {
             pf_ev.resize((m->layers.size() + 2) * kPfSlots);
             for (cudaEvent_t& ev : pf_ev) CK(cudaEventCreateWithFlags(&ev, cudaEventDefault));
         }
@@ -2351,7 +2443,10 @@ struct Engine {
         const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
         // STRATA_Q36_PREFILL_TIMING: phase boundaries for the prompt path (0 attention, 1 router+host round trip,
         // 2 expert product, 3 shared expert + combine).  A no-op unless the events were created at init.
-        auto mark = [&](int k) { if (pf_on) cudaEventRecord(pf_ev[li * kPfSlots + (size_t) k], st); };
+        auto mark = [&](int k) {
+            if (pf_on || (decode_profile && T <= kVerify && p0 >= 60000))
+                cudaEventRecord(pf_ev[li * kPfSlots + (size_t) k], st);
+        };
         mark(0);
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
@@ -2500,7 +2595,11 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    if (q8att)
+                    if (q8att && decode_tile)
+                        k_attn_part_q8_tile<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
+                            q8v, qsc, k8[li], ks8[li], v8[li], vs8[li], dpos, t0, H, HKV, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
+                    else if (q8att)
                         k_attn_part_q8<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(q8v, qsc, k8[li], ks8[li], v8[li], vs8[li],
                                                                                   dpos, t0, H, HKV, ctx, 1.0f / sqrtf((float) HD),
                                                                                   n_chunk, pacc, pm, pl);
@@ -2623,7 +2722,7 @@ struct Engine {
                 if (lhy(l)) seq.push_back((int) l);
             stream_begin(seq);
         }
-        if (split) {
+        if (split && !(split_graphs && graph_mode)) {
             sp_pre(*this, T);   // the prefix ran this chunk on the other card: x and h come in
             x_ready = true;
             sp_post(*this, T, p0);   // and it takes the next one now, beside this chunk's tail
@@ -2756,7 +2855,12 @@ struct Engine {
 
     /// After a verify window of T rows: the GDN state takes the first n_keep rows (conv history and recurrence run
     /// again over the rows' kept inputs).
-    void commit(int n_keep) {
+    void commit(int n_keep, bool local = false) {
+        if (split_graphs && !local) {
+            graph_run(gs().gc[n_keep], [&] { commit(n_keep, true); }, true);
+            if (split) sp_mirror_commit(*this, n_keep);
+            return;
+        }
         const auto& g = m->g;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, C = (int) g.ssm_conv_channels;
         for (size_t l = 0; l < m->layers.size(); ++l) {
@@ -2766,7 +2870,7 @@ struct Engine {
             k_gdn_seq<<<HV, dim3(128, 4), 0, st>>>(S[l], v_hc[l], C, v_alpha[l], v_beta[l], z, L.ssm_norm, m->eps,
                                                    nullptr, HK, HV, n_keep, true);
         }
-        if (split) sp_mirror_commit(*this, n_keep);
+        if (split && !local) sp_mirror_commit(*this, n_keep);
     }
 
     // ---- the hybrid mode
@@ -2967,14 +3071,18 @@ struct Engine {
                 if (*g) { CK(cudaGraphExecDestroy(*g)); *g = nullptr; }
             for (auto& g : gset.gv)
                 if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
+            for (auto& g : gset.gm_first)
+                if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
+            for (auto& g : gset.gc)
+                if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
         }
         for (auto& kv : row_graphs)
             if (kv.second) CK(cudaGraphExecDestroy(kv.second));
         row_graphs.clear();
     }
 
-    template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
-        if (!use_graph) { body(); return; }
+    template <class F> void graph_run(cudaGraphExec_t& gx, F body, bool local = false) {
+        if (!use_graph && !local) { body(); return; }
         if (!gx) {
             cudaGraph_t graph = nullptr;
             CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
@@ -3088,6 +3196,25 @@ struct Engine {
             std::fprintf(stderr, "strata-q36 prefill T=%d: the first query slice of the attention layers: scores %.1f, "
                          "softmax %.1f, pv %.1f ms\n", T, asc, asm_, apv);
         pf_maxr = 0;
+    }
+
+    void decode_report(const char* tag, bool mtp) {
+        double phase[6] = {}, attn = 0, gdn = 0;
+        const size_t begin = mtp ? m->layers.size() : 0;
+        const size_t end = mtp ? begin + 1 : m->layers.size();
+        for (size_t l = begin; l < end; ++l) {
+            for (int k = 0; k < 6; ++k) {
+                float v = 0.f;
+                CK(cudaEventElapsedTime(&v, pf_ev[l * kPfSlots + k], pf_ev[l * kPfSlots + k + 1]));
+                phase[k] += v;
+                if (k == 1) {
+                    if (mtp || m->layers[l].attn) attn += v;
+                    else gdn += v;
+                }
+            }
+        }
+        std::fprintf(stderr, "DECODE-PHASE %s device%d proj %.3f attention %.3f gdn %.3f router %.3f experts %.3f shared %.3f combine %.3f ms\n",
+                     tag, dev, phase[0], attn, gdn, phase[2], phase[3], phase[4], phase[5]);
     }
 
     /// The tokens at the current position: a prompt in chunks (eager), one token from the decode graph.  The last
@@ -3371,6 +3498,8 @@ struct Engine {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
+        const bool profile = decode_profile && pos >= 60000 && decode_profile_steps++ < 3;
+        const auto trace_start = profile ? Clock::now() : Clock::time_point{};
         CK(cudaStreamSynchronize(st));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
         for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
@@ -3383,13 +3512,18 @@ struct Engine {
         if (!fix.empty())
             CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
-        forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+        if (split_graphs && D > 0)
+            graph_run(gs().gm_first[T0], [&] { forward_mtp(T0, pos - (int64_t) fix.size(), seeds, true, true); }, true);
+        else
+            forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
         drafts.assign((size_t) D, 0);
         if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[0] = hpin[2];
         }
+        const double first_ms = profile ? ms_since(trace_start) : 0.0;
+        if (profile) decode_report("mtp-first", true);
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
             hpin[0] = drafts[(size_t) d - 1];
@@ -3398,12 +3532,14 @@ struct Engine {
             CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(seeds, hmtp + (size_t) last_row * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             last_row = 0;
-            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
+            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph || split_graphs); }, split_graphs);
             else forward_mtp(1, pos + d, seeds, true, false);
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[(size_t) d] = hpin[2];
         }
+        const double draft_ms = profile ? ms_since(trace_start) : 0.0;
+        if (profile && D > 1) decode_report("mtp-chain", true);
         // the verify window
         const int T = D + 1;
         hpin[16] = x_tok;
@@ -3413,11 +3549,21 @@ struct Engine {
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         if (split)   // the prefix's half of the window: the same rows at the same positions
             sp_stage_run(*this, hpin + 16, T, pos, true);
+        if (split_graphs) {
+            sp_pre(*this, T);
+            x_ready = true;
+        }
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph || split_graphs, true); }, split_graphs);
         rows_deferred = false;
+        if (split_graphs) x_ready = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        const double verify_ms = profile ? ms_since(trace_start) : 0.0;
+        if (profile) {
+            decode_report("verify-tail", false);
+            if (split) sp_decode_report(*this);
+        }
         int a = 0;
         while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
         if (cancel != nullptr && cancel->load()) a = 0;
@@ -3426,6 +3572,12 @@ struct Engine {
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
         after_rows(a + 1);
+        if (profile) {
+            CK(cudaStreamSynchronize(st));
+            std::fprintf(stderr, "DECODE-WALL pos %lld first %.3f chain %.3f verify %.3f commit+report %.3f ms accepted %d/%d\n",
+                         (long long) pos, first_ms, draft_ms - first_ms, verify_ms - draft_ms,
+                         ms_since(trace_start) - verify_ms, a, D);
+        }
         return a;
     }
 
@@ -3546,6 +3698,11 @@ struct Split {
         }
         a->split = nullptr;
         b->split = this;
+        const char* graph_env = std::getenv("STRATA_Q36_SPLIT_GRAPHS");
+        a->split_graphs = b->split_graphs = graph_env && std::atoi(graph_env) != 0 &&
+            a->use_graph && b->use_graph && !a->main_hybrid && !b->main_hybrid && b->mtp_graph &&
+            !a->decode_profile && !b->decode_profile && !a->verify_k && !b->verify_k && !xdump_on();
+        if (b->split_graphs) std::fprintf(stderr, "strata-q36: card-local split decode graphs, handoff outside capture\n");
         a->use_graph = false;   // the handoff and B's layers cannot be captured as one graph
         b->use_graph = false;
         snap_map();
@@ -3584,7 +3741,10 @@ struct Split {
             } else {
                 if (r.snap) snapshot();
                 stage(r.tok.data(), r.T, r.pos, r.slot);
-                a->forward(r.T, r.pos, 0, false, r.verify);
+                if (a->split_graphs && r.verify)
+                    a->graph_run(a->gs().gv[r.T], [&] { a->forward(r.T, r.pos, 0, true, true); }, true);
+                else
+                    a->forward(r.T, r.pos, 0, false, r.verify);
                 out(r.T, r.slot, r.id);
             }
             {
@@ -3739,6 +3899,14 @@ void sp_mirror_select(Engine& E, int i) {
         Split::Dev d(S.a->dev);
         S.a->select(i);
         S.snap_map();   // the snapshot follows the session's buffers
+    });
+}
+void sp_decode_report(Engine& E) {
+    Split& S = *E.split;
+    S.on_prefix([&S] {
+        Split::Dev d(S.a->dev);
+        CK(cudaStreamSynchronize(S.a->st));
+        S.a->decode_report("verify-prefix", false);
     });
 }
 void sp_mirror_commit(Engine& E, int n_keep) {
