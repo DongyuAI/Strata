@@ -2560,8 +2560,11 @@ struct Engine {
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
             prep_in(T);
+            mark(9);
             apply(L.qkv, xq, qkv_b, T);
+            mark(10);
             apply(L.zg, xq, z, T);
+            mark(11);
             if (T <= kGemmT) {
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
@@ -2604,9 +2607,12 @@ struct Engine {
             mark(2);
         } else {
             prep_in(T);
+            mark(9);
             apply(L.wq, xq, qg, T);
+            mark(10);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
+            mark(11);
             RowSel rs;
             if (rows_mode) {
                 rs.cell = d_rcell;
@@ -3328,6 +3334,18 @@ struct Engine {
         }
         std::fprintf(stderr, "DECODE-PHASE %s device%d proj %.3f attention %.3f gdn %.3f router %.3f experts %.3f shared %.3f combine %.3f ms\n",
                      tag, dev, phase[0], attn, gdn, phase[2], phase[3], phase[4], phase[5]);
+        if (decode_profile) {   // inside the projection: the activation image, the first product, the rest
+            double pre = 0, a1 = 0, a2 = 0;
+            for (size_t l = 0; l < m->layers.size(); ++l) {
+                float t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+                CK(cudaEventElapsedTime(&t0, pf_ev[l * kPfSlots], pf_ev[l * kPfSlots + 9]));
+                CK(cudaEventElapsedTime(&t1, pf_ev[l * kPfSlots + 9], pf_ev[l * kPfSlots + 10]));
+                CK(cudaEventElapsedTime(&t2, pf_ev[l * kPfSlots + 10], pf_ev[l * kPfSlots + 11]));
+                (void) t3;
+                pre += t0; a1 += t1; a2 += t2;
+            }
+            std::fprintf(stderr, "DECODE-PROJ %s device%d quant %.3f first %.3f rest %.3f ms\n", tag, dev, pre, a1, a2);
+        }
         if (prev != dev) CK(cudaSetDevice(prev));
     }
 
