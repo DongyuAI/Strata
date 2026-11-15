@@ -106,12 +106,43 @@ move fewer of them and to stop paying for both cards in series:
 - **The output head on both cards.** 0.42 GB of Q6_K, 2.8 ms on one card. Both cards reading half of it makes it
   1.4 ms, and the reduction is 248,320 values.
 - **Both cards on every layer.** Today the layer split makes a token the sum of the two cards' times. Running each
-  layer's rows on both cards makes it the maximum instead, and the 40.16 µs exchange is affordable at that count
-  (about 40 exchanges a token is 1.6 ms). This is the largest single item and it is an engine change, not a setting.
+  layer's rows on both cards makes it the maximum instead. This is the largest single item and it is an engine change,
+  not a setting. What it costs is measured below.
 - **Fewer weight bytes.** 2.06 GB a token for 8 of 256 experts: 2-bit experts and lower-precision dense weights are
   the remaining lever, and those do change the quantization.
 
 The state above is what is committed here. It is a checkpoint, not the end of the work.
+
+## What the two cards cost each other
+
+Two numbers decide whether running every layer's rows on both cards is worth building, and both are now measured.
+
+**Each card's own GPU time.** `STRATA_Q36_CARD_TIMING` puts events around each card's forward, inside the split, so
+the handoff is outside them: card 0 9.47 ms, card 1 11.62 ms for 20 layers each. The sum, 21.09 ms, is the measured
+token interval 21.30 ms to within 0.21 ms. **The two cards do not overlap at all today**; a token is their sum. (The
+per-layer phase marks above sum to 13.0 and 11.7 ms because each card's marks include the time it spends waiting for
+the other, which is why they are not the number to project from.)
+
+**The exchange a row split needs.** One card pushes its half of the residual — 1024 floats — into mapped host memory,
+fences, flags it, spins on the peer's flag, and reads the peer's half. Both cards run their own stream on their own
+host thread with the whole loop enqueued ahead, so the host is out of the loop and the wait is a device-side spin
+(`xchg8.cu`). Over 200 iterations, averaged over the two cards:
+
+| step | µs a layer |
+| --- | ---: |
+| push 4 KB + flag only (control: launch and write, no wait, no read) | 16.2 |
+| flag round trip only (no payload) | 16.7 |
+| peer read only, 4 KB (no wait) | 17.4 |
+| **the whole exchange** | **23.8** |
+
+The launch floor is 7.4 µs of that, so a 4 KB write to host memory costs about 9 µs and a 4 KB read about 10 µs, and
+the flag round trip fits inside the payload movement. 23.8 µs a layer is 80 exchanges a token (one after attention,
+one after the experts) at 1.9 ms, against 9.47 ms of card 0 work that a row split would halve. That is the trade the
+row split makes, and it is affordable. There is no peer access between these cards in either direction, so mapped host
+memory is the only path.
+
+Note that the 40.16 µs figure quoted in `xchg.cu` is `cudaMemcpyPeerAsync`, which falls back to host memory when there
+is no peer access and is not the path an exchange would take; 23.8 µs is the path it would.
 
 ## Files
 
@@ -120,6 +151,8 @@ The state above is what is committed here. It is a checkpoint, not the end of th
 - `mb2.cu` — peak read bandwidth against block count, the router-shaped GEMV on its own, and the dp4a rate.
 - `sm.cu` — the launch floor: an empty kernel, and the 2048-wide norm at 1 to 20 blocks.
 - `xchg.cu` — peer access between the two cards, and the cost of an 8 KB exchange.
+- `xchg8.cu` — the exchange a row split would run: two host threads, two streams, the loop enqueued ahead, the wait a
+  device-side spin on a mapped flag. Prints the exchange, the flag alone, the payload alone and the launch control.
 - `native_expert_bench` (`src/kernels/native_expert_bench.cpp`, `--target native_expert_bench`) — the expert step on
   real GGUF rows, mode against mode, bitwise and timed. The geometry now comes from the tensors, so it runs on a
   model that is not Flash-Next.

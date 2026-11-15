@@ -642,6 +642,84 @@ __global__ void k_attn_part_q8_tile(const signed char* __restrict__ q8, const fl
     const float total = warp_sum(l);
     if (lane == 0) { pm[oi] = m; pl[oi] = total; }
 }
+/// The same pass with a 32-cell tile instead of 64: half the staged K/V (8.7 KB instead of 17.4 KB a block), so the
+/// block's 12 KB of shared memory fits 8 a multiprocessor instead of 3 and the card's memory pipeline has twice the
+/// loads in flight.  Each lane takes one cell, so the online softmax rounds in a different order than the 64-cell
+/// form; that is the only difference (a 32-lane butterfly where the 64-cell form uses two half-warps).
+__global__ void k_attn_part_q8_tile32(const signed char* __restrict__ q8, const float* __restrict__ qsc,
+                                      const signed char* __restrict__ k8, const float* __restrict__ ksc,
+                                      const signed char* __restrict__ v8, const float* __restrict__ vsc,
+                                      const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale, int n_chunk,
+                                      float* pacc, float* pm, float* pl) {
+    constexpr int HD = 256, kDims = 8, kT = 32;
+    const int c = blockIdx.x, row = blockIdx.y;
+    const int tr = row / HKV, kvh = row % HKV, t = t0 + tr;
+    const int npos = *pos0 + t + 1, p0 = c * kChunkCells;
+    if (p0 >= npos) return;
+    __shared__ int4 Q[8][16], KV[kT][17];
+    __shared__ float weights[8][kT], ks[kT], vs[kT];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int h = kvh * (H / HKV) + warp, d0 = lane * kDims;
+    if (tid < 8 * 16) {
+        const int qh = kvh * (H / HKV) + tid / 16;
+        Q[tid / 16][tid % 16] = *reinterpret_cast<const int4*>(q8 + ((size_t) t * H + qh) * HD + (tid % 16) * 16);
+    }
+    const float qs = qsc[(size_t) t * H + h];
+    float o[kDims] = {}, m = -INFINITY, l = 0.f;
+    for (int pb = p0; pb < p0 + kChunkCells; pb += kT) {
+        if (pb >= npos) break;
+        for (int i = tid; i < kT * 16; i += 256) {
+            const int p = pb + i / 16, w = i % 16;
+            KV[i / 16][w] = p < npos && p < ctx
+                ? *reinterpret_cast<const int4*>(k8 + ((size_t) kvh * ctx + p) * HD + w * 16)
+                : make_int4(0, 0, 0, 0);
+        }
+        if (tid < kT) {
+            const int p = pb + tid;
+            ks[tid] = p < npos && p < ctx ? ksc[(size_t) kvh * ctx + p] : 0.f;
+            vs[tid] = p < npos && p < ctx ? vsc[(size_t) kvh * ctx + p] : 0.f;
+        }
+        __syncthreads();
+        int a0 = 0;
+#pragma unroll
+        for (int w = 0; w < 16; ++w) {
+            const int4 q = Q[warp][w], k0 = KV[lane][w];
+            a0 = __dp4a(q.x, k0.x, a0);
+            a0 = __dp4a(q.y, k0.y, a0);
+            a0 = __dp4a(q.z, k0.z, a0);
+            a0 = __dp4a(q.w, k0.w, a0);
+        }
+        const float s0 = pb + lane < npos ? (float) a0 * qs * ks[lane] * scale : -INFINITY;
+        const float mn = fmaxf(m, warp_max(s0));
+        const float r = expf(m - mn), e0 = expf(s0 - mn);
+#pragma unroll
+        for (int j = 0; j < kDims; ++j) o[j] *= r;
+        l = l * r + e0;
+        m = mn;
+        weights[warp][lane] = e0 * vs[lane];
+        __syncthreads();
+        for (int i = tid; i < kT * 16; i += 256) {
+            const int p = pb + i / 16, w = i % 16;
+            KV[i / 16][w] = p < npos && p < ctx
+                ? *reinterpret_cast<const int4*>(v8 + ((size_t) kvh * ctx + p) * HD + w * 16)
+                : make_int4(0, 0, 0, 0);
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (int p = 0; p < kT; ++p) {
+            const float w = weights[warp][p];
+            const signed char* vp = reinterpret_cast<const signed char*>(&KV[p][0]) + d0;
+#pragma unroll
+            for (int j = 0; j < kDims; ++j) o[j] = fmaf(w, (float) vp[j], o[j]);
+        }
+        __syncthreads();
+    }
+    const size_t oi = ((size_t) tr * H + h) * n_chunk + c;
+#pragma unroll
+    for (int j = 0; j < kDims; ++j) pacc[oi * HD + d0 + j] = o[j];
+    const float total = warp_sum(l);
+    if (lane == 0) { pm[oi] = m; pl[oi] = total; }
+}
 // The same tiled split-K, but a block scores R rows of a verify window against one read of the chunk.  The one-row
 // kernel above re-reads every KV cell once per row, which made attention the largest single term of a 3-row window
 // at 60K.  Rows of a window see the same cells; only their queries differ.
@@ -1389,6 +1467,7 @@ struct Model {
     const float* out_norm = nullptr;
     const float* tail_norm = nullptr;   // a slice's last layer: the next layer's attn_norm (the other device's first)
     Mat head;
+    int head_off = 0;   // the first vocabulary row this card's copy of the head holds (head_split: 0 or n_vocab / 2)
     const uint8_t* embd = nullptr;
     int embd_type = -1;
     size_t embd_row = 0;
@@ -1475,7 +1554,7 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
 /// (and with the last too when it has the MTP block, whose rows embed the token: `mtp_embd`).
 /// (Each range is a whole engine: `tail_norm` carries the norm the layer after its last needs.)
 bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, int l0 = 0, int l1 = -1,
-          bool mtp_embd = false) {
+          bool mtp_embd = false, int head_part = -1) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
     const strata::GgufModel& gm = *m.file;
@@ -1542,6 +1621,34 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, in
         return w;
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
+    // A row range of a matrix: every quant format keeps a row's blocks contiguous, so rows [r0, r1) are one memcpy.
+    // The output head is split this way across two cards (see head_split): each holds half the vocabulary's rows.
+    auto mat_rows = [&](const std::string& name, int r0, int r1) -> Mat {
+        size_t s = 0;
+        const strata::TensorInfo* t = find(name, s);
+        Mat w;
+        w.type = (int) t->type;
+        w.n_in = (int) t->shape[0];
+        const int full = (int) t->shape[1];
+        if (!K::native_mmvq_supported(w.type)) {
+            std::fprintf(stderr, "strata-q36: %s is %s, which the native MMVQ does not take\n", name.c_str(), t->type_name());
+            std::exit(1);
+        }
+        if (r1 <= r0 || r1 > full) {
+            err = name + ": bad row range";
+            std::exit(1);
+        }
+        const uint64_t nb = strata::tensor_payload_bytes(*t);
+        const size_t row = (size_t) (nb / (uint64_t) full);
+        const size_t take = row * (size_t) (r1 - r0);
+        uint8_t* d = nullptr;
+        CK(cudaMalloc(&d, take));
+        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t) + (size_t) r0 * row, take, cudaMemcpyHostToDevice));
+        bytes += take;
+        w.n_out = r1 - r0;
+        w.d = d;
+        return w;
+    };
     if (l1 < 0 || l1 > (int) g.n_layers) l1 = (int) g.n_layers;
     if (l0 < 0 || l0 >= l1) {
         err = "bad layer range";
@@ -1619,9 +1726,17 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, in
         m.mtp_hnorm = f32(L(l, "nextn.hnorm.weight"));
         m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
     }
+    // head_part 0 / 1: this card holds the first / second half of the head's vocabulary rows (STRATA_Q36_HEAD_SPLIT)
+    const int hv = (int) g.n_vocab;
+    const int hr0 = head_part == 1 ? hv / 2 : 0;
+    const int hr1 = head_part >= 0 ? (head_part == 0 ? hv / 2 : hv) : -1;
     if (l1 == (int) g.n_layers) {   // the head with the last range only
         m.out_norm = f32("output_norm.weight");
-        m.head = mat("output.weight");
+        m.head = head_part >= 0 ? mat_rows("output.weight", hr0, hr1) : mat("output.weight");
+        m.head_off = head_part >= 0 ? hr0 : 0;
+    } else if (head_part >= 0) {   // a half of the head on the card that does not run the last range
+        m.head = mat_rows("output.weight", hr0, hr1);
+        m.head_off = hr0;
     }
     if (l0 == 0 || mtp_embd) {   // the embeddings with the first range (and with a tail that has the MTP block)
         size_t s = 0;
@@ -1728,6 +1843,8 @@ struct Engine {
     bool kv8_on = true;
     bool decode_tile = false;
     bool decode_tile_rows = false;
+    bool attn_t32 = false;   // STRATA_Q36_ATTN_T32: the 32-cell decode tile (half the shared memory, twice the blocks)
+    bool head_split = false;  // STRATA_Q36_HEAD_SPLIT: each card holds half the head's vocabulary rows (split mode)
     signed char* q8v = nullptr;   // this forward's queries as q8 rows [T][H][HD]
     float* qsc = nullptr;         // [T][H]
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
@@ -2081,6 +2198,7 @@ struct Engine {
             cudaFuncSetAttribute((const void*) k_attn_part_q8, cudaFuncAttributePreferredSharedMemoryCarveout,
                                  cudaSharedmemCarveoutMaxShared);
             struct { const char* n; const void* f; } ks[] = {{"attn_tile", (const void*) k_attn_part_q8_tile},
+                                                             {"attn_tile32", (const void*) k_attn_part_q8_tile32},
                                                              {"attn_tile_rows", (const void*) k_attn_part_q8_tile_rows<4>},
                                                              {"attn_q8", (const void*) k_attn_part_q8},
                                                              {"add_rms_q", (const void*) q36k::k_add_rms_q},
@@ -2115,6 +2233,10 @@ struct Engine {
             if (const char* e = std::getenv("STRATA_Q36_DECODE_TILE"))
                 decode_tile = g.n_head == 8 * g.n_head_kv && std::atoi(e) != 0;
             if (decode_tile) std::fprintf(stderr, "strata-q36: tiled q8 decode attention with float weights\n");
+            if (const char* e = std::getenv("STRATA_Q36_ATTN_T32")) {
+                attn_t32 = std::atoi(e) != 0;
+                if (attn_t32) std::fprintf(stderr, "strata-q36: decode attention on 32-cell tiles\n");
+            }
             if (const char* e = std::getenv("STRATA_Q36_DECODE_TILE_ROWS"))
                 decode_tile_rows = decode_tile && std::atoi(e) != 0;
             if (decode_tile_rows) std::fprintf(stderr, "strata-q36: verify rows share one read of each KV chunk\n");
@@ -2785,9 +2907,14 @@ struct Engine {
                             q8v, qsc, k8[li], ks8[li], v8[li], vs8[li], dpos, t0, H, HKV, ctx,
                             1.0f / sqrtf((float) HD), n_chunk, nt, pacc, pm, pl);
                     else if (q8att && decode_tile)
-                        k_attn_part_q8_tile<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
-                            q8v, qsc, k8[li], ks8[li], v8[li], vs8[li], dpos, t0, H, HKV, ctx,
-                            1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
+                        if (attn_t32)
+                            k_attn_part_q8_tile32<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
+                                q8v, qsc, k8[li], ks8[li], v8[li], vs8[li], dpos, t0, H, HKV, ctx,
+                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
+                        else
+                            k_attn_part_q8_tile<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
+                                q8v, qsc, k8[li], ks8[li], v8[li], vs8[li], dpos, t0, H, HKV, ctx,
+                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
                     else if (q8att)
                         k_attn_part_q8<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(q8v, qsc, k8[li], ks8[li], v8[li], vs8[li],
                                                                                   dpos, t0, H, HKV, ctx, 1.0f / sqrtf((float) HD),
@@ -2961,7 +3088,7 @@ struct Engine {
             xsum("OUThm", bh.data(), n1);
             if (T == 1) state_dump();
         }
-        if (heads > 0) {
+        if (heads > 0 && !head_split) {
             // STRATA_Q36_HEAD_TIMING: the output head is outside the layer marks, and it is 417 MB of Q6_K a token
             static const bool head_t = std::getenv("STRATA_Q36_HEAD_TIMING") != nullptr;
             if (!head_t || graph_mode) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
@@ -3016,6 +3143,21 @@ struct Engine {
         mm(m->head, hn, lg, n);
         k_argmax<<<dim3(kArgBlocks, n), kThreads, 0, st>>>(lg, (int) g.n_vocab, pk, amv, ami, false);
         k_argmax<<<dim3(1, n), kThreads, 0, st>>>(lg, kArgBlocks, pk, amv, ami, true);
+        if (std::getenv("STRATA_Q36_HEAD_SPLIT_DEBUG")) {
+            float v = 0.f;
+            int32_t i = 0;
+            CK(cudaStreamSynchronize(st));
+            CK(cudaMemcpy(&v, amv, 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(&i, pk, 4, cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "HEADFULL %.4f @%d\n", v, i);
+        }
+    }
+    /// One card's half of the output head (head_split): the product over this card's vocabulary rows and the argmax over
+    /// them.  amv[0] and pick[0] then hold that half's best value and its index inside the half.
+    void head_half(const float* hn) {
+        mm(m->head, hn, logits, 1);
+        k_argmax<<<dim3(kArgBlocks, 1), kThreads, 0, st>>>(logits, m->head.n_out, pick, amv, ami, false);
+        k_argmax<<<dim3(1, 1), kThreads, 0, st>>>(logits, kArgBlocks, pick, amv, ami, true);
     }
 
     /// The draft head: the MTP block's pick over the first `draft_n` rows of the output matrix only (the lowest token ids are
@@ -3874,6 +4016,7 @@ struct Split {
     cudaEvent_t ev[2] = {};               // the prefix has filled a slot (recorded on its stream)
     cudaEvent_t cev[2] = {};              // the tail has read a slot (recorded on its stream, after the H2D)
     int32_t* ph = nullptr;                // pinned: the chunks' positions (2 slots)
+    float* hh = nullptr;                  // pinned: the head split's hidden state (STRATA_Q36_HEAD_SPLIT)
     int par = 0;                          // the parity of the chunk being handed over
     const int32_t* toks = nullptr;        // the read in progress (its tokens are copied into the request when posted)
     int64_t ntok = 0, next_i = 0;
@@ -3915,6 +4058,12 @@ struct Split {
 
     bool init(std::string& err) {
         if (cudaHostAlloc((void**) &ph, 8, cudaHostAllocDefault) != cudaSuccess) { err = "split: pinned memory"; return false; }
+        if (a->head_split) {   // the head's hidden state, and its half's best value / index
+            if (cudaHostAlloc((void**) &hh, (size_t) b->m->g.n_embd * 4, cudaHostAllocDefault) != cudaSuccess) {
+                err = "split: pinned memory";
+                return false;
+            }
+        }
         {
             Dev da(a->dev);   // the handoff events are the prefix's; recorded on its stream
             for (int i = 0; i < 2; ++i) {
@@ -3974,12 +4123,29 @@ struct Split {
             } else {
                 if (r.snap) snapshot();
                 stage(r.tok.data(), r.T, r.pos, r.slot);
+                // STRATA_Q36_CARD_TIMING: this card's own GPU time for the chunk, which is what a split can overlap
+                static const bool card_t = std::getenv("STRATA_Q36_CARD_TIMING") != nullptr;
+                cudaEvent_t ce0 = nullptr, ce1 = nullptr;
+                if (card_t) {
+                    CK(cudaEventCreate(&ce0));
+                    CK(cudaEventCreate(&ce1));
+                    CK(cudaEventRecord(ce0, a->st));
+                }
                 if (a->split_graphs && r.verify)
                     a->graph_run(a->gs().gv[r.T], [&] { a->forward(r.T, r.pos, 0, true, true); }, true);
                 else if (a->split_graphs && r.T == 1)
                     a->graph_run(a->gs().g1, [&] { a->forward(1, r.pos, 0, true, false); }, true);
                 else
                     a->forward(r.T, r.pos, 0, false, r.verify);
+                if (card_t) {
+                    CK(cudaEventRecord(ce1, a->st));
+                    CK(cudaEventSynchronize(ce1));
+                    float ms = 0.f;
+                    CK(cudaEventElapsedTime(&ms, ce0, ce1));
+                    std::fprintf(stderr, "CARD-PREFIX dev%d T %d %.3f ms\n", a->dev, r.T, ms);
+                    CK(cudaEventDestroy(ce0));
+                    CK(cudaEventDestroy(ce1));
+                }
                 out(r.T, r.slot, r.id);
             }
             {
@@ -4188,10 +4354,54 @@ int64_t sp_process(Engine& B, const int32_t* toks, int64_t n, F on_chunk_) {
         if (B.split_graphs) {   // one token: the handoff outside the capture, this card's layers inside it
             sp_pre(B, 1);
             B.x_ready = true;
+            static const bool card_t = std::getenv("STRATA_Q36_CARD_TIMING") != nullptr;
+            cudaEvent_t ce0 = nullptr, ce1 = nullptr;
+            if (card_t) {
+                CK(cudaEventCreate(&ce0));
+                CK(cudaEventCreate(&ce1));
+                CK(cudaEventRecord(ce0, B.st));
+            }
             B.graph_run(B.gs().g1, [&] { B.forward(1, B.pos, 1, true, false); }, true);
+            if (card_t) {
+                CK(cudaEventRecord(ce1, B.st));
+                CK(cudaEventSynchronize(ce1));
+                float ms = 0.f;
+                CK(cudaEventElapsedTime(&ms, ce0, ce1));
+                std::fprintf(stderr, "CARD-TAIL dev%d T 1 %.3f ms\n", B.dev, ms);
+                CK(cudaEventDestroy(ce0));
+                CK(cudaEventDestroy(ce1));
+            }
             B.x_ready = false;
         } else {
             B.forward(1, B.pos, 1, false, false);
+        }
+        if (B.head_split) {
+            // Each card takes the argmax of its half of the head; the two best pairs are compared here, so the cards
+            // exchange 8 KB of hidden state and 8 bytes of answer instead of 497 KB of logits.
+            const float* hn = B.hmain;
+            B.head_half(hn);
+            CK(cudaMemcpyAsync(S.hh, hn, (size_t) N * 4, cudaMemcpyDeviceToHost, B.st));
+            CK(cudaStreamSynchronize(B.st));
+            float tv = -INFINITY, pv = -INFINITY;
+            int32_t ti = 0, pi = 0;
+            CK(cudaMemcpy(&tv, B.amv, 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(&ti, B.pick, 4, cudaMemcpyDeviceToHost));
+            S.on_prefix([&] {
+                Split::Dev d(S.a->dev);
+                CK(cudaMemcpy(S.a->hmain, S.hh, (size_t) N * 4, cudaMemcpyHostToDevice));
+                S.a->head_half(S.a->hmain);
+                CK(cudaStreamSynchronize(S.a->st));
+                CK(cudaMemcpy(&pv, S.a->amv, 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(&pi, S.a->pick, 4, cudaMemcpyDeviceToHost));
+            });
+            int32_t best = ti + B.m->head_off;
+            const int32_t pb = pi + S.a->m->head_off;
+            static const bool tail_only = std::getenv("STRATA_Q36_HEAD_SPLIT_TAILONLY") != nullptr;
+            if (!tail_only && (pv > tv || (pv == tv && pb < best))) best = pb;
+            if (std::getenv("STRATA_Q36_HEAD_SPLIT_DEBUG"))
+                std::fprintf(stderr, "HEADSPLIT tail %.4f @%d  prefix %.4f @%d  -> %d\n", tv, ti, pv, pi, best);
+            CK(cudaMemcpyAsync(B.pick, &best, 4, cudaMemcpyHostToDevice, B.st));
+            CK(cudaStreamSynchronize(B.st));
         }
         B.rows_deferred = false;
         if (B.decode_profile && B.pos >= 60000 && B.decode_profile_steps++ < 3) {   // the phase marks of this token
@@ -5292,10 +5502,14 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     try {
         if (want_split) {
+            // STRATA_Q36_HEAD_SPLIT: the output head is 413 MB of Q6_K and only the last card reads it today, while the
+            // other card sits idle through it.  Half the vocabulary's rows go on each card; each takes the argmax of its
+            // own half and the two best pairs are compared, so the exchange is 8 bytes and not the logits.
+            const bool hs = std::getenv("STRATA_Q36_HEAD_SPLIT") != nullptr && std::atoi(std::getenv("STRATA_Q36_HEAD_SPLIT")) != 0;
             CK(cudaSetDevice(0));
-            if (!load(model, ma, err, mtp_d > 0, 0, split_l1)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+            if (!load(model, ma, err, mtp_d > 0, 0, split_l1, false, hs ? 0 : -1)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
             CK(cudaSetDevice(1));
-            if (!load(model, m, err, mtp_d > 0, split_l1, -1, true)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+            if (!load(model, m, err, mtp_d > 0, split_l1, -1, true, hs ? 1 : -1)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
         } else if (!load(model, m, err, mtp_d > 0)) {
             std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
             return 1;
@@ -5380,6 +5594,8 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         pipe.a = &A;
         pipe.b = &E;
+        A.head_split = E.head_split = std::getenv("STRATA_Q36_HEAD_SPLIT") != nullptr &&
+                                       std::atoi(std::getenv("STRATA_Q36_HEAD_SPLIT")) != 0;
         if (!pipe.init(err)) {
             std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
             return 1;
