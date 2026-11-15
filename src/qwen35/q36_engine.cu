@@ -622,6 +622,108 @@ __global__ void k_attn_part_q8_tile(const signed char* __restrict__ q8, const fl
     const float total = warp_sum(l);
     if (lane == 0) { pm[oi] = m; pl[oi] = total; }
 }
+// The same tiled split-K, but a block scores R rows of a verify window against one read of the chunk.  The one-row
+// kernel above re-reads every KV cell once per row, which made attention the largest single term of a 3-row window
+// at 60K.  Rows of a window see the same cells; only their queries differ.
+template <int R>
+__global__ void k_attn_part_q8_tile_rows(const signed char* __restrict__ q8, const float* __restrict__ qsc,
+                                         const signed char* __restrict__ k8, const float* __restrict__ ksc,
+                                         const signed char* __restrict__ v8, const float* __restrict__ vsc,
+                                         const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale,
+                                         int n_chunk, int nrows, float* pacc, float* pm, float* pl) {
+    constexpr int HD = 256, kDims = 8;
+    const int c = blockIdx.x, grp = blockIdx.y;
+    const int rg = grp / HKV, kvh = grp % HKV, r0 = rg * R;
+    const int nr = min(R, nrows - r0);
+    if (nr <= 0) return;
+    const int npos = *pos0 + t0 + nrows, p0 = c * kChunkCells;   // the last row's causal bound: the load bound
+    if (p0 >= npos) return;
+    __shared__ int4 Q[R][8][16], KV[64][17];
+    __shared__ float weights[R][8][64], ks[64], vs[64];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int h = kvh * (H / HKV) + warp, d0 = lane * kDims;
+    for (int i = tid; i < nr * 8 * 16; i += kChunkCells) {
+        const int r = i / 128, qh = (i % 128) / 16, w = i % 16;
+        Q[r][qh][w] = *reinterpret_cast<const int4*>(
+            q8 + ((size_t) (t0 + r0 + r) * H + kvh * (H / HKV) + qh) * HD + w * 16);
+    }
+    float o[R][kDims] = {}, m[R], l[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) { m[r] = -INFINITY; l[r] = 0.f; }
+    for (int pb = p0; pb < p0 + kChunkCells; pb += 64) {
+        if (pb >= npos) break;
+        for (int i = tid; i < 64 * 16; i += kChunkCells) {
+            const int p = pb + i / 16, w = i % 16;
+            KV[i / 16][w] = p < npos && p < ctx
+                ? *reinterpret_cast<const int4*>(k8 + ((size_t) kvh * ctx + p) * HD + w * 16)
+                : make_int4(0, 0, 0, 0);
+        }
+        if (tid < 64) {
+            const int p = pb + tid;
+            ks[tid] = p < npos && p < ctx ? ksc[(size_t) kvh * ctx + p] : 0.f;
+            vs[tid] = p < npos && p < ctx ? vsc[(size_t) kvh * ctx + p] : 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r >= nr) break;
+            const float qs = qsc[(size_t) (t0 + r0 + r) * H + h];
+            const int npr = *pos0 + t0 + r0 + r + 1;   // this row's causal bound; the chunk is loaded for the last row
+            int a0 = 0, a1 = 0;
+#pragma unroll
+            for (int w = 0; w < 16; ++w) {
+                const int4 qv = Q[r][warp][w], k0 = KV[lane][w], k1 = KV[lane + 32][w];
+                a0 = __dp4a(qv.x, k0.x, a0);
+                a0 = __dp4a(qv.y, k0.y, a0);
+                a0 = __dp4a(qv.z, k0.z, a0);
+                a0 = __dp4a(qv.w, k0.w, a0);
+                a1 = __dp4a(qv.x, k1.x, a1);
+                a1 = __dp4a(qv.y, k1.y, a1);
+                a1 = __dp4a(qv.z, k1.z, a1);
+                a1 = __dp4a(qv.w, k1.w, a1);
+            }
+            const float s0 = pb + lane < npr ? (float) a0 * qs * ks[lane] * scale : -INFINITY;
+            const float s1 = pb + lane + 32 < npr ? (float) a1 * qs * ks[lane + 32] * scale : -INFINITY;
+            const float mn = fmaxf(m[r], warp_max(fmaxf(s0, s1)));
+            const float rr = expf(m[r] - mn), e0 = expf(s0 - mn), e1 = expf(s1 - mn);
+#pragma unroll
+            for (int j = 0; j < kDims; ++j) o[r][j] *= rr;
+            l[r] = l[r] * rr + (e0 + e1);
+            m[r] = mn;
+            weights[r][warp][lane] = e0 * vs[lane];
+            weights[r][warp][lane + 32] = e1 * vs[lane + 32];
+        }
+        __syncthreads();
+        for (int i = tid; i < 64 * 16; i += kChunkCells) {
+            const int p = pb + i / 16, w = i % 16;
+            KV[i / 16][w] = p < npos && p < ctx
+                ? *reinterpret_cast<const int4*>(v8 + ((size_t) kvh * ctx + p) * HD + w * 16)
+                : make_int4(0, 0, 0, 0);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r >= nr) break;
+#pragma unroll 1
+            for (int p = 0; p < 64; ++p) {
+                const float w = weights[r][warp][p];
+                const signed char* vp = reinterpret_cast<const signed char*>(&KV[p][0]) + d0;
+#pragma unroll
+                for (int j = 0; j < kDims; ++j) o[r][j] = fmaf(w, (float) vp[j], o[r][j]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (r >= nr) break;
+        const size_t oi = ((size_t) (r0 + r) * H + h) * n_chunk + c;
+#pragma unroll
+        for (int j = 0; j < kDims; ++j) pacc[oi * HD + d0 + j] = o[r][j];
+        const float total = warp_sum(l[r]);
+        if (lane == 0) { pm[oi] = m[r]; pl[oi] = total; }
+    }
+}
 
 __device__ __forceinline__ int dp4(const int4& a, const int4& b, int s) {
     s = __dp4a(a.x, b.x, s);
@@ -1605,6 +1707,7 @@ struct Engine {
     std::vector<float*> ks8, vs8;
     bool kv8_on = true;
     bool decode_tile = false;
+    bool decode_tile_rows = false;
     signed char* q8v = nullptr;   // this forward's queries as q8 rows [T][H][HD]
     float* qsc = nullptr;         // [T][H]
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
@@ -1953,6 +2056,9 @@ struct Engine {
             if (const char* e = std::getenv("STRATA_Q36_DECODE_TILE"))
                 decode_tile = g.n_head == 8 * g.n_head_kv && std::atoi(e) != 0;
             if (decode_tile) std::fprintf(stderr, "strata-q36: tiled q8 decode attention with float weights\n");
+            if (const char* e = std::getenv("STRATA_Q36_DECODE_TILE_ROWS"))
+                decode_tile_rows = decode_tile && std::atoi(e) != 0;
+            if (decode_tile_rows) std::fprintf(stderr, "strata-q36: verify rows share one read of each KV chunk\n");
             q8v = dalloc_t<signed char>(T * (size_t) g.n_head * g.head_dim);
             qsc = dalloc(T * (size_t) g.n_head);
             if (const char* e = std::getenv("STRATA_Q36_PRE_I8"))
@@ -2595,7 +2701,11 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    if (q8att && decode_tile)
+                    if (q8att && decode_tile_rows && nt > 1)
+                        k_attn_part_q8_tile_rows<4><<<dim3(nc, ((nt + 3) / 4) * HKV), kChunkCells, 0, st>>>(
+                            q8v, qsc, k8[li], ks8[li], v8[li], vs8[li], dpos, t0, H, HKV, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, nt, pacc, pm, pl);
+                    else if (q8att && decode_tile)
                         k_attn_part_q8_tile<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
                             q8v, qsc, k8[li], ks8[li], v8[li], vs8[li], dpos, t0, H, HKV, ctx,
                             1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
@@ -3199,6 +3309,9 @@ struct Engine {
     }
 
     void decode_report(const char* tag, bool mtp) {
+        int prev = 0;
+        CK(cudaGetDevice(&prev));
+        if (prev != dev) CK(cudaSetDevice(dev));
         double phase[6] = {}, attn = 0, gdn = 0;
         const size_t begin = mtp ? m->layers.size() : 0;
         const size_t end = mtp ? begin + 1 : m->layers.size();
@@ -3215,6 +3328,7 @@ struct Engine {
         }
         std::fprintf(stderr, "DECODE-PHASE %s device%d proj %.3f attention %.3f gdn %.3f router %.3f experts %.3f shared %.3f combine %.3f ms\n",
                      tag, dev, phase[0], attn, gdn, phase[2], phase[3], phase[4], phase[5]);
+        if (prev != dev) CK(cudaSetDevice(prev));
     }
 
     /// The tokens at the current position: a prompt in chunks (eager), one token from the decode graph.  The last
@@ -3743,6 +3857,8 @@ struct Split {
                 stage(r.tok.data(), r.T, r.pos, r.slot);
                 if (a->split_graphs && r.verify)
                     a->graph_run(a->gs().gv[r.T], [&] { a->forward(r.T, r.pos, 0, true, true); }, true);
+                else if (a->split_graphs && r.T == 1)
+                    a->graph_run(a->gs().g1, [&] { a->forward(1, r.pos, 0, true, false); }, true);
                 else
                     a->forward(r.T, r.pos, 0, false, r.verify);
                 out(r.T, r.slot, r.id);
@@ -3946,8 +4062,20 @@ int64_t sp_process(Engine& B, const int32_t* toks, int64_t n, F on_chunk_) {
         CK(cudaMemcpyAsync(B.tok, B.hpin, 4, cudaMemcpyHostToDevice, B.st));
         CK(cudaMemcpyAsync(B.pos0, B.hpin + 1, 4, cudaMemcpyHostToDevice, B.st));
         B.rows_deferred = true;
-        B.forward(1, B.pos, 1, false, false);
+        if (B.split_graphs) {   // one token: the handoff outside the capture, this card's layers inside it
+            sp_pre(B, 1);
+            B.x_ready = true;
+            B.graph_run(B.gs().g1, [&] { B.forward(1, B.pos, 1, true, false); }, true);
+            B.x_ready = false;
+        } else {
+            B.forward(1, B.pos, 1, false, false);
+        }
         B.rows_deferred = false;
+        if (B.decode_profile && B.pos >= 60000) {   // the marks are recorded from 60K on only
+            CK(cudaStreamSynchronize(B.st));
+            B.decode_report("token-tail", false);
+            sp_decode_report(B);
+        }
         CK(cudaMemcpyAsync(B.hlast, B.hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, B.st));
         B.pos += 1;
         B.after_rows(1);
