@@ -1067,6 +1067,57 @@ __global__ void __launch_bounds__(512) k_gdn_seq_cols(float* state, const float*
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = sv[r];
 }
+__global__ void __launch_bounds__(256)
+k_gdn_tiled_cols(float* state, const float* h, int C, const float* gate, const float* beta,
+                  float* out, int h_k, int h_v, int T) {
+    constexpr int S = 128, CW = 4, RG = 8, RPG = 16, BT = 32, NC = 32;
+    __shared__ float sk[BT][S], sq[BT][S], vv[BT][NC], gg[BT], bb[BT];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, rg = lane / CW, cl = lane % CW;
+    const int head = blockIdx.x, col0 = blockIdx.y * NC, col = col0 + warp * CW + cl, qh = head % h_k;
+    const size_t stride = (size_t) h_v * S;
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    float sv[RPG];
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) sv[r] = base[r * stride];
+    for (int t0 = 0; t0 < T; t0 += BT) {
+        __syncthreads();
+        const int nt = min(BT, T - t0);
+        for (int i = tid; i < nt * S; i += 256) {
+            const int t = i / S, d = i % S;
+            sk[t][d] = h[(size_t) (t0 + t) * C + h_k * S + qh * S + d];
+            sq[t][d] = h[(size_t) (t0 + t) * C + qh * S + d];
+        }
+        for (int i = tid; i < nt * NC; i += 256) {
+            const int t = i / NC, d = i % NC;
+            vv[t][d] = h[(size_t) (t0 + t) * C + 2 * h_k * S + head * S + col0 + d];
+        }
+        if (tid < nt) {
+            gg[tid] = __expf(gate[(size_t) (t0 + tid) * h_v + head]);
+            bb[tid] = beta[(size_t) (t0 + tid) * h_v + head];
+        }
+        __syncthreads();
+        for (int t = 0; t < nt; ++t) {
+            float kv = 0.f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) kv = fmaf(sv[r], sk[t][rg * RPG + r], kv);
+#pragma unroll
+            for (int off = 16; off >= CW; off >>= 1) kv += __shfl_xor_sync(0xffffffffu, kv, off);
+            const float g = gg[t], delta = (vv[t][warp * CW + cl] - g * kv) * bb[t];
+            float o = 0.f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                sv[r] = fmaf(g, sv[r], sk[t][rg * RPG + r] * delta);
+                o = fmaf(sv[r], sq[t][rg * RPG + r], o);
+            }
+#pragma unroll
+            for (int off = 16; off >= CW; off >>= 1) o += __shfl_xor_sync(0xffffffffu, o, off);
+            if (rg == 0) out[((size_t) (t0 + t) * h_v + head) * S + col] = o * rsqrtf((float) S);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * stride] = sv[r];
+}
+
 /// y = rms(o) * gamma * SiLU(z) per (token, V head): grid (HV, T), block 128.
 __global__ void __launch_bounds__(128) k_gdn_norm(const float* o_raw, const float* z, const float* gamma, float eps,
                                                   float* y, int h_v) {
@@ -1498,6 +1549,7 @@ struct Engine {
     bool pre_i8 = false;
     signed char* v8t = nullptr;        // [kv head][head_dim][ctxp]: a layer's q8 V cache transposed (k_v8_t)
     int ctxp = 0;
+    bool gdn_tiled = false;
     // the prompt's MMQ experts
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
@@ -1730,6 +1782,8 @@ struct Engine {
             CK(cudaGetDevice(&dev));
             CK(cudaDeviceGetAttribute(&ccm, cudaDevAttrComputeCapabilityMajor, dev));
             fp16_attn = ccm >= 7;
+            if (const char* e = std::getenv("STRATA_Q36_GDN_TILED")) gdn_tiled = ccm == 6 && std::atoi(e) != 0;
+            if (gdn_tiled) std::fprintf(stderr, "strata-q36: shared-staged warp GDN prompt recurrence\n");
             if (const char* e = std::getenv("STRATA_Q36_FP32_ATTN")) fp16_attn = std::atoi(e) == 0;
         }
         // the FP16 operands exist only where the prompt attention runs in FP16: on Pascal they would hold their size in
@@ -2333,8 +2387,11 @@ struct Engine {
                 k_conv_seq<<<dim3(C / 128, tiles), 128, 0, st>>>(conv[li], qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, T, !verify);
                 if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
                     mark(7);
-                    k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(S[li], hc_b, C, al_b,
-                                                                                                      be_b, gdn_y, HK, HV, T);
+                    if (gdn_tiled)
+                        k_gdn_tiled_cols<<<dim3(HV, 4), 256, 0, st>>>(S[li], hc_b, C, al_b, be_b, gdn_y, HK, HV, T);
+                    else
+                        k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(S[li], hc_b, C, al_b,
+                                                                                                          be_b, gdn_y, HK, HV, T);
                     k_gdn_norm<<<dim3(HV, T), 128, 0, st>>>(gdn_y, z, L.ssm_norm, m->eps, gdn_y, HV);
                     mark(8);
                 } else {   // decode, verify windows and commits: one kernel, so a window's rows are a decode step's rows
