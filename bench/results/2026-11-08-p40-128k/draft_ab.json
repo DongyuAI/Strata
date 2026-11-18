@@ -1,0 +1,42 @@
+[
+ {
+  "name": "a8k_dflash2",
+  "drafter": "dflash2",
+  "asked": 8000,
+  "prompt_tokens": 8032,
+  "prompt_tps": 342.8,
+  "decode_tps": 30.9,
+  "generated": 256,
+  "drafts": "128/235",
+  "acceptance": 54.5,
+  "drafter_log": [
+   "strata serve: DFlash2 drafter on (F:\\LLMs\\dflash2\\qwen3.8-flash-next-dflash2.q4_0.pack, graphs captured in 6 ms); windows up to 8 tokens; no MTP layer is loaded (--draft-fallback none); layer split: the drafter is on CUDA1 (last stage), the other stages' taps are gathered onto it"
+  ]
+ },
+ {
+  "name": "a192k_mtp",
+  "drafter": "mtp",
+  "asked": 192000,
+  "prompt_tokens": 192052,
+  "prompt_tps": 626.8,
+  "decode_tps": 31.2,
+  "generated": 256,
+  "drafts": "127/189",
+  "acceptance": 67.2,
+  "drafter_log": []
+ },
+ {
+  "name": "a192k_dflash2",
+  "drafter": "dflash2",
+  "asked": 192000,
+  "prompt_tokens": 192052,
+  "prompt_tps": 636.8,
+  "decode_tps": 32.1,
+  "generated": 256,
+  "drafts": "139/211",
+  "acceptance": 65.9,
+  "drafter_log": [
+   "strata serve: DFlash2 drafter on (F:\\LLMs\\dflash2\\qwen3.8-flash-next-dflash2.q4_0.pack, graphs captured in 5 ms); windows up to 8 tokens; no MTP layer is loaded (--draft-fallback none); layer split: the drafter is on CUDA1 (last stage), the other stages' taps are gathered onto it"
+  ]
+ }
+]

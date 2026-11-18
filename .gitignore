@@ -95,3 +95,7 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# reference checkouts kept beside the source for reading, not part of the build
+/1Cat-vLLM-1.5.2/
+/llama.cpp-1.0.0/
