@@ -16,7 +16,8 @@ namespace strata::prefill::ws {
 
 /// The products of a layer: 1 with STRATA_MMQ_WS=1 (opt-in) gate/up and down, else 0 (the per-group MMQ).  0 also where
 /// the build has no kernels (HIP, no ggml sources, not the STRATA_EXPERIMENTAL_SM60 build) or a visible GPU is not
-/// cc 6.0 (the kernels were tuned and checked on GP100 only).
+/// cc 6.0 (the kernels were tuned and checked on GP100 only).  STRATA_MMQ_WS=2 also admits cc 6.1 (P40: the same SM
+/// generation, native __dp4a, the same kernels); nothing was measured there when this was written.
 int mode();
 /// mode() != 0 and both formats have kernels.
 bool supported(int gu_type, int d_type);

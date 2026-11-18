@@ -75,12 +75,16 @@ __global__ void __launch_bounds__(128) gdn_chunk_kkt_kernel(float* __restrict__ 
                                                             const float* __restrict__ h,
                                                             const float* __restrict__ beta,
                                                             const float* __restrict__ gcum, int nchunks) {
-    // 2 * CH * SP f32: the k and q tiles (opt-in, > 48 KB).  SP pads the row so the dot loop's row-strided
-    // reads do not all land in one shared bank (S = 128 floats is a whole number of bank rows).
+    // CH * SP f32: the k tile only, 33 KB.  SP pads the row so the dot loop's row-strided reads do not all
+    // land in one shared bank (S = 128 floats is a whole number of bank rows).  The q tile is NOT staged:
+    // staging both needs 2 * CH * SP * 4 = 66 KB, which is past the 48 KB a Pascal block can ask for, and the
+    // launch then fails with "invalid argument" (measured on a P40, 2026-11-10).  q is read from the global
+    // tile instead: a warp's 32 lanes all have the same t and the same i, so every read is one broadcast
+    // address served by L1, and the values are the same ones the staged copy would hold - the dot's order and
+    // its rounding are unchanged, so this stays bit for bit the tile version.
     constexpr int SP = S + 1;
     extern __shared__ float sh[];
     float* ks = sh;
-    float* qs = sh + CH * SP;
     const int hh = blockIdx.y, ch = blockIdx.x, qh = hh % HK;
     const int64_t base = (size_t) ch * CH;
     const float* kh = h + base * C + (size_t) HK * S + (size_t) qh * S;
@@ -88,7 +92,6 @@ __global__ void __launch_bounds__(128) gdn_chunk_kkt_kernel(float* __restrict__ 
     for (int i = threadIdx.x; i < CH * S; i += blockDim.x) {
         const int t = i / S, j = i % S;
         ks[t * SP + j] = kh[(size_t) t * C + j];
-        qs[t * SP + j] = qh_[(size_t) t * C + j];
     }
     __syncthreads();
     float* Ap = A + ((size_t) ch * HV + hh) * CH * CH;
@@ -97,11 +100,12 @@ __global__ void __launch_bounds__(128) gdn_chunk_kkt_kernel(float* __restrict__ 
         const int t = p / CH, s = p % CH;
         if (s > t) continue;
         const float dec = expf(gcum[(base + t) * HV + hh] - gcum[(base + s) * HV + hh]);
+        const float* qt = qh_ + (size_t) t * C;
         float pq = 0.0f, pq1 = 0.0f;
 #pragma unroll 4
         for (int i = 0; i < S; i += 2) {
-            pq = fmaf(qs[t * SP + i], ks[s * SP + i], pq);
-            pq1 = fmaf(qs[t * SP + i + 1], ks[s * SP + i + 1], pq1);
+            pq = fmaf(__ldg(qt + i), ks[s * SP + i], pq);
+            pq1 = fmaf(__ldg(qt + i + 1), ks[s * SP + i + 1], pq1);
         }
         Pp[t * CH + s] = (pq + pq1) * dec;
         if (s < t) {
@@ -569,7 +573,7 @@ void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const
         if (dev >= 0 && dev < 64 && !attr_done[dev]) {
             const cudaError_t ek = cudaFuncSetAttribute(gdn_chunk_kkt_kernel,
                                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                        2 * CH * (S + 1) * (int) sizeof(float));
+                                                        CH * (S + 1) * (int) sizeof(float));
             const cudaError_t ew = cudaFuncSetAttribute(gdn_chunk_wmma_kernel,
                                                         cudaFuncAttributeMaxDynamicSharedMemorySize, WMMA_SMEM);
             cudaGetLastError();
@@ -605,7 +609,7 @@ void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const
                 state, oc + t0 * HV * S, h + t0 * C, beta + t0 * HV, w.gcum, nch);
             check("wmma");
         } else {
-            gdn_chunk_kkt_kernel<<<dim3((unsigned) nch, HV), 128, 2 * CH * (S + 1) * sizeof(float), cs>>>(
+            gdn_chunk_kkt_kernel<<<dim3((unsigned) nch, HV), 128, CH * (S + 1) * sizeof(float), cs>>>(
                 w.A, w.P, h + t0 * C, beta + t0 * HV, w.gcum, nch);
             check("kkt");
         }

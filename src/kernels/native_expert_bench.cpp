@@ -60,7 +60,9 @@ int main(int argc, char** argv) {
     const int iters = argc > 7 ? std::atoi(argv[7]) : 200;
     const int NTOK = 8;
     if (T < 1 || T > NTOK || G < 1) { std::fprintf(stderr, "tokens 1..8, groups >= 1\n"); return 2; }
-    const int64_t H = 2560, FF_FULL = 640, FF = FF_FULL;   // Flash-Next's expert geometry
+    // the geometry comes from the tensors (Flash-Next was H 2560, FF 640): gate is [n_embd, n_ff, n_expert]
+    int64_t H = std::getenv("BENCH_H") ? std::atoll(std::getenv("BENCH_H")) : 2560;
+    int64_t FF_FULL = std::getenv("BENCH_FF") ? std::atoll(std::getenv("BENCH_FF")) : 640;
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
@@ -74,6 +76,11 @@ int main(int argc, char** argv) {
             for (int r = 0; r < 3; ++r)
                 if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+        if (!std::getenv("BENCH_H") && t[0]->shape.size() >= 2) {
+            H = (int64_t) t[0]->shape[0];
+            FF_FULL = (int64_t) t[0]->shape[1];
+        }
+        const int64_t FF = FF_FULL;
         cpu::NativeFmt f;
         std::string err;
         if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {

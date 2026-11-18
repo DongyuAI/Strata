@@ -28,7 +28,7 @@ inline std::size_t smem_bytes(int ncols, int n_in) {
     return std::size_t(ncols) * std::size_t(n_in) + std::size_t(ncols) * std::size_t(n_in / 32) * sizeof(float);
 }
 
-template<int NCOLS, int TPR>
+template<int NCOLS, int TPR, bool CH2>
 __launch_bounds__(THREADS)
 __global__ void kernel(const int8_t* __restrict__ qs, const half* __restrict__ dpl, const Q81Block* __restrict__ x,
                        float* __restrict__ y, int n_in, int n_out) {
@@ -59,6 +59,28 @@ __global__ void kernel(const int8_t* __restrict__ qs, const half* __restrict__ d
         if (row < n_out) {
             const int4* w = reinterpret_cast<const int4*>(qs + std::size_t(row) * n_in);
             const half* d = dpl + std::size_t(row) * nb;
+            if (CH2) {   // 32 bytes a lane a step: two weight loads in flight, 215 vs 201 GB/s on a P40's 8192x2048
+                for (int c = lane; c < nch; c += TPR * 2) {
+                    const int c1 = c + TPR;
+                    const int4 wv0 = __ldg(w + c), wv1 = __ldg(w + c1);
+                    const float dw0 = __half2float(d[c >> 1]), dw1 = __half2float(d[c1 >> 1]);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) {
+                        const int4 xv0 = reinterpret_cast<const int4*>(sx + std::size_t(j) * n_in)[c];
+                        const int4 xv1 = reinterpret_cast<const int4*>(sx + std::size_t(j) * n_in)[c1];
+                        int s0 = STRATA_DP4A(wv0.x, xv0.x, 0);
+                        s0 = STRATA_DP4A(wv0.y, xv0.y, s0);
+                        s0 = STRATA_DP4A(wv0.z, xv0.z, s0);
+                        s0 = STRATA_DP4A(wv0.w, xv0.w, s0);
+                        int s1 = STRATA_DP4A(wv1.x, xv1.x, 0);
+                        s1 = STRATA_DP4A(wv1.y, xv1.y, s1);
+                        s1 = STRATA_DP4A(wv1.z, xv1.z, s1);
+                        s1 = STRATA_DP4A(wv1.w, xv1.w, s1);
+                        acc[j] += dw0 * sd[j * nb + (c >> 1)] * float(s0);
+                        acc[j] += dw1 * sd[j * nb + (c1 >> 1)] * float(s1);
+                    }
+                }
+            } else
             for (int c = lane; c < nch; c += TPR) {
                 const int4 wv = __ldg(w + c);
                 const float dw = __half2float(d[c >> 1]);
@@ -106,7 +128,10 @@ void launch_one(const int8_t* qs, const half* d, const Q81Block* x, float* y, in
     constexpr int RPB = THREADS / TPR;
     const int groups = (n_out + RPB - 1) / RPB;
     const int grid = (std::min)(groups, sm_count() * blocks_per_sm());
-    kernel<NCOLS, TPR><<<unsigned(grid), THREADS, smem_bytes(NCOLS, n_in), s>>>(qs, d, x, y, n_in, n_out);
+    const size_t sh = smem_bytes(NCOLS, n_in);
+    if ((n_in / 16) % (TPR * 2) == 0)
+        kernel<NCOLS, TPR, true><<<unsigned(grid), THREADS, sh, s>>>(qs, d, x, y, n_in, n_out);
+    else kernel<NCOLS, TPR, false><<<unsigned(grid), THREADS, sh, s>>>(qs, d, x, y, n_in, n_out);
 }
 
 template<int NCOLS>

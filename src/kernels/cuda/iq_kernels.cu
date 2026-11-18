@@ -2389,6 +2389,37 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
             }
             return;
         }
+    } else if constexpr (SUB_DOWN && TD == 23) {
+        // IQ4_XS down rows of 512 values: 16 dots a row, so the warp-per-row form leaves half of every warp idle and
+        // issues one load per row.  Here 16 lanes take a row and RB rows a half-warp, the RB loads issued before any
+        // reduction; 16 dots also means the 16-lane butterfly below is the 32-lane one with zeros in its upper half,
+        // so the sums are bitwise the warp form's.  n_embd % (16 * RB) == 0 (2048 -> 32 row blocks).
+        constexpr int RB = 4;
+        if (nb * Fmt<TD>::ipb == 16 && L.n_embd % (16 * RB) == 0) {
+            const int half = threadIdx.x >> 4, t = threadIdx.x & 15;
+            const int kbx = t / Fmt<TD>::ipb, iqs = Fmt<TD>::step * (t % Fmt<TD>::ipb);
+            const int nrb = (int) (L.n_embd / (16 * RB));
+            for (int rb = blockIdx.x; rb < nrb; rb += gridDim.x) {
+                const int r0 = rb * 16 * RB + half * RB;
+                for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+                    const uint8_t* wr = (const uint8_t*) grp_ptr[g] + L.down_off + (size_t) r0 * L.d_row;
+                    const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;   // NVFP4: s_down
+                    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+                    for (int e = e0; e < e1; ++e) {
+                        const block_q8_1* x = hq + (size_t) e * hb;
+                        float s[RB];
+#pragma unroll
+                        for (int q = 0; q < RB; ++q) s[q] = Fmt<TD>::dot(wr + (size_t) q * L.d_row, x, kbx, iqs);
+#pragma unroll
+                        for (int q = 0; q < RB; ++q) {
+                            for (int m = 8; m > 0; m >>= 1) s[q] += __shfl_xor_sync(0xffffffffu, s[q], m);
+                            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r0 + q] = s[q] * sd;
+                        }
+                    }
+                }
+            }
+            return;
+        }
     }
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = blockIdx.x * 8 + warp;

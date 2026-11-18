@@ -55,15 +55,29 @@ int mode() {
     const int o = g_mode_override.load(std::memory_order_relaxed);
     if (o >= 0) return o;
     static const int m = [] {
-        const char* e = std::getenv("STRATA_MMQ_WS");   // opt-in
-        if (e == nullptr || std::atoi(e) != 1) return 0;
-        // GP100 (cc 6.0) only: tuned and checked there (any visible GPU that is not: off for all)
+        const char* e = std::getenv("STRATA_MMQ_WS");   // opt-in: 1 = GP100 (cc 6.0), 2 = also cc 6.1 (P40, research)
+        if (e == nullptr) return 0;
+        const int v = std::atoi(e);
+        if (v != 1 && v != 2) return 0;
+        // GP100 (cc 6.0) only: tuned and checked there (any visible GPU that is not: off for all).  =2 also admits
+        // cc 6.1, which is the same SM generation with native __dp4a; nothing was measured there when this was written,
+        // so the default (=1) is unchanged and =2 is a measurement switch.
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) { cudaGetLastError(); return 0; }
         for (int d = 0; d < n; ++d) {
             cudaDeviceProp p{};
-            if (cudaGetDeviceProperties(&p, d) != cudaSuccess || p.major != 6 || p.minor != 0) { cudaGetLastError(); return 0; }
+            if (cudaGetDeviceProperties(&p, d) != cudaSuccess) { cudaGetLastError(); return 0; }
+            if (p.major != 6 || (p.minor != 0 && !(v == 2 && p.minor == 1))) {
+                std::fprintf(stderr, "strata prefill: STRATA_MMQ_WS=%d but device %d is cc %d.%d (needs 6.0, or 6.1 with =2)\n",
+                             v, d, p.major, p.minor);
+                std::fflush(stderr);
+                cudaGetLastError();
+                return 0;
+            }
         }
+        std::fprintf(stderr, "strata prefill: STRATA_MMQ_WS=%d on %d device(s) of cc 6.x: the weight-stationary expert "
+                             "products may run on a layer whose experts are all resident\n", v, n);
+        std::fflush(stderr);
         return 1;
     }();
     return m;
