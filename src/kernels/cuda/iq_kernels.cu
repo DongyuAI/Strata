@@ -4640,10 +4640,34 @@ void launch_down_ws(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups,
 namespace nibk = strata::core::nibble;
 
 __device__ __forceinline__ uint32_t nib_prmt(uint32_t a, uint32_t b, uint32_t sel) {
+#if defined(STRATA_HIP_GFX906)
+    // gfx906 port: PTX prmt.b32 is NVIDIA-only. The IQ3_S path (our target) never calls
+    // this; IQ2_S/IQ3_XXS use selectors with the sign-replicate bit (bit 3), which
+    // v_perm_b32 lacks. __builtin_amdgcn_perm covers the plain byte-select modes; the
+    // byte_perm compat helper maps CUDA's {y:x} selector ordering for us.
+    return __byte_perm(a, b, sel);
+#else
     uint32_t r;
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));   // the sign-replicate modes too
     return r;
+#endif
 }
+
+#if defined(STRATA_HIP_GFX906)
+// gfx906 port: the IQ3_S P-skeleton parity check uses __vadd4(u,u); the compat layer
+// only defines __vsub4. Packed byte add with no cross-byte carry (u lanes are <= 15,
+// so 2u <= 30 < 256): plain integer add is exact per byte.
+#ifndef __vadd4
+#define __vadd4(a, b) ((int)((unsigned int)(a) + (unsigned int)(b)))
+#endif
+// CUDA's __ldcv is a volatile const load; read each word through a volatile pointer
+// so the transcode self-check really reads back from memory (HIP_vector_type has no
+// volatile copy constructor).
+#ifndef __ldcv
+#define __ldcv(p) ([] (const void* q) { const volatile unsigned int* w = (const volatile unsigned int*) q; \
+    uint4 r; r.x = w[0]; r.y = w[1]; r.z = w[2]; r.w = w[3]; return r; }(p))
+#endif
+#endif
 
 // One item's code -> the production W (what Split<TG>::load gives for the same GGUF item, byte for byte).
 template<int TG> struct NibLoad;

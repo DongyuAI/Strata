@@ -27,6 +27,10 @@
 #define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
 #define cudaErrorNotReady hipErrorNotReady
+// gfx906 nibble port: error enums used by the 4-bit expert slots (STRATA_EXPERT_NIBBLE).
+#define cudaErrorInvalidValue hipErrorInvalidValue
+#define cudaErrorInvalidDevice hipErrorInvalidDevice
+#define cudaErrorInvalidResourceHandle hipErrorInvalidResourceHandle
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorStreamCaptureUnsupported hipErrorStreamCaptureUnsupported
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
@@ -85,6 +89,10 @@
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetErrorName hipGetErrorName
 #define cudaGetLastError hipGetLastError
+// gfx906 nibble port: kernel attribute / occupancy queries (nib_gu_proto.cuh).
+#define cudaFuncAttributes hipFuncAttributes
+#define cudaFuncGetAttributes hipFuncGetAttributes
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaGetDevice hipGetDevice
 #define cudaSetDevice hipSetDevice

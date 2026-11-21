@@ -33,6 +33,11 @@
 #if defined(STRATA_EXPERIMENTAL_SM60) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && \
     !defined(STRATA_GPU_METAL)
 #define STRATA_EXPERT_NIBBLE_BUILT 1
+#elif defined(STRATA_HIP_GFX906)
+// gfx906 port (opt/mi50-gfx906): build the 4-bit nibble expert kernels so the
+// IQ3_S gate/up path can drop the per-block codebook LUT lookup. Runtime switch
+// STRATA_EXPERT_NIBBLE stays OFF by default; nothing changes unless it is set.
+#define STRATA_EXPERT_NIBBLE_BUILT 1
 #else
 #define STRATA_EXPERT_NIBBLE_BUILT 0
 #endif

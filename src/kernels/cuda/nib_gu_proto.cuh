@@ -115,8 +115,14 @@ void nibx_launch_one(dim3 grid, cudaStream_t s, const unsigned long long* grp_pt
                      const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, float* gate, float* up,
                      cudaFuncAttributes* attr) {
     if (attr) {
+#if defined(STRATA_HIP_GFX906)
+        // HIP's hipFuncGetAttributes takes a plain const void*, not a typed kernel pointer.
+        hipFuncGetAttributes(attr, (const void*) nibx_gu_kernel<TG, RB>);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&g_nibx_occ, nibx_gu_kernel<TG, RB>, 256, 0);
+#else
         cudaFuncGetAttributes(attr, nibx_gu_kernel<TG, RB>);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&g_nibx_occ, nibx_gu_kernel<TG, RB>, 256, 0);
+#endif
         return;
     }
     nibx_gu_kernel<TG, RB><<<dim3(80 / RB, grid.y), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, gate, up);
