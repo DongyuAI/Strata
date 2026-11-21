@@ -5924,6 +5924,28 @@ template<int SG> struct DotG<23, SG> { __device__ static __forceinline__ float f
 template<int SG> struct DotG<12, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
                                                       const uint32_t*) { return vec_dot_q4_K_q8_1(vbq, bq8_1, kbx, iqs); } };
 
+// opt(mi50/gfx906) step14: Q4_K gate/up with LDS staging + ds_read_b128 on the activation side.
+// At staging time the 4 scattered q8_1 words a Q4_K dot needs (block 2*boff_idx+i, qs[sub] and qs[sub+4],
+// i=0,1) are gathered into one 16-byte slot; the dot reads that slot with a single b128.  Staging is paid
+// once per chunk and reused by all rows (LDS_NT tokens), so the gather amortizes.  Reuse the exact
+// vec_dot_q4_K_q8_1_impl_vmmq -> bitwise identical output.
+struct alignas(16) Q4KB128Slot { uint4 q; float2 ds; };   // 16B qs + 8B (two q8_1 scales), 24B, 16B-aligned
+__device__ __forceinline__ float vec_dot_q4_K_q8_1_b128(const void* __restrict__ vbq, const Q4KB128Slot* __restrict__ slots,
+                                                        int kbx, int iqs) {
+    const block_q4_K* bq4 = (const block_q4_K*) vbq + kbx;
+    const int boff_idx = (iqs / 2) / 4, sub = (iqs / 2) & 3;
+    const Q4KB128Slot& s = slots[kbx * 16 + boff_idx * 4 + sub];
+    const int* q4 = (const int*) (bq4->qs + 16 * (2 * boff_idx) + 4 * sub);
+    int v[2]; v[0] = q4[0]; v[1] = q4[4];
+    uint16_t aux[2];
+    k_scale_min(bq4->scales, 2 * boff_idx, aux);
+    const uint8_t* sc = (const uint8_t*) aux;
+    const uint8_t* m = sc + 2;
+    int u[4]; u[0] = s.q.x; u[1] = s.q.y; u[2] = s.q.z; u[3] = s.q.w;
+    float d8[2]; d8[0] = s.ds.x; d8[1] = s.ds.y;
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4->dm, d8);
+}
+
 constexpr int LDS_RB = 64;    // gate/up rows per block (4 R2 passes of 16)
 constexpr int LDS_NT = 4;     // entries whose activations sit in LDS at once
 
@@ -6015,6 +6037,88 @@ __global__ void __launch_bounds__(256) native_gu_lds_kernel(const unsigned long 
                 s0 = warp_sum(s0);
                 s1 = warp_sum(s1);
                 if (lane == 0) { put(row0, c0 + j, s0); if (two) put(row1, c0 + j, s1); }
+            }
+        }
+    }
+}
+
+// opt(mi50/gfx906) step14: Q4_K gate/up, LDS staging with the activations gathered into b128-readable slots.
+// Identical row/token tiling and addition order to native_gu_lds_kernel; only the activation read is vectorized.
+__global__ void __launch_bounds__(256) native_gu_lds_b128_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                 const int32_t* __restrict__ grp_start,
+                                                                 const int32_t* __restrict__ n_groups,
+                                                                 const int32_t* __restrict__ ent_tok,
+                                                                 const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                                 float* __restrict__ gate, float* __restrict__ up) {
+    extern __shared__ int s_raw[];          // LDS_NT tokens x nb*16 slots of Q4KB128Slot
+    Q4KB128Slot* slots = reinterpret_cast<Q4KB128Slot*>(s_raw);
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int nb = (int) (L.n_embd / Fmt<12>::qk), xb = (int) (L.n_embd / 32);
+    const int nslots = nb * 16;             // 10 * 16 = 160 slots per token
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    const int nrow = 2 * (int) L.n_ff;
+    auto wrow = [&](int row) -> const uint8_t* {
+        const bool is_up = row >= L.n_ff;
+        return blob + (is_up ? L.up_off : 0) + (size_t) (is_up ? row - (int) L.n_ff : row) * L.gu_row;
+    };
+    auto put = [&](int row, int e, float v) {
+        const bool is_up = row >= L.n_ff;
+        (is_up ? up : gate)[(size_t) e * L.n_ff + (is_up ? row - (int) L.n_ff : row)] = v;
+    };
+    for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
+        const int cn = min(LDS_NT, e1 - c0);
+        __syncthreads();
+        // gather: slot(kbx,boff_idx,sub) = {block[2*boff_idx].qs[sub], .qs[sub+4], block[+1].qs[sub], .qs[sub+4]}
+        for (int j = 0; j < cn; ++j) {
+            const block_q8_1* xt = xq + (size_t) ent_tok[c0 + j] * xb;
+            for (int idx = tid; idx < nslots; idx += 256) {
+                const int kbx = idx >> 4, boff_idx = (idx >> 2) & 3, sub = idx & 3;
+                const block_q8_1* b0 = xt + kbx * (Fmt<12>::qk / 32) + 2 * boff_idx;
+                const int* q0 = (const int*) b0->qs;
+                const int* q1 = (const int*) (b0 + 1)->qs;
+                Q4KB128Slot s;
+                s.q = make_uint4((uint32_t) q0[sub], (uint32_t) q0[sub + 4], (uint32_t) q1[sub], (uint32_t) q1[sub + 4]);
+                s.ds = make_float2(__low2float(b0->ds), __low2float((b0 + 1)->ds));
+                slots[j * nslots + idx] = s;
+            }
+        }
+        __syncthreads();
+        for (int p = 0; p < LDS_RB / 16; ++p) {
+            const int row0 = blockIdx.x * LDS_RB + p * 16 + warp, row1 = row0 + 8;
+            if (row0 >= nrow) break;
+            const bool two = row1 < nrow;
+            const uint8_t* w0 = wrow(row0);
+            const uint8_t* w1 = wrow(two ? row1 : row0);
+            auto pass = [&](auto ntc) {
+                constexpr int NTC = decltype(ntc)::value;
+                float s0[NTC], s1[NTC];
+#pragma unroll
+                for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
+                for (int k = lane; k < nb * Fmt<12>::ipb; k += 32) {
+                    const int kbx = k / Fmt<12>::ipb, iqs = Fmt<12>::step * (k % Fmt<12>::ipb);
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        const Q4KB128Slot* sj = slots + (size_t) j * nslots;
+                        const float a = vec_dot_q4_K_q8_1_b128(w0, sj, kbx, iqs);
+                        const float b = vec_dot_q4_K_q8_1_b128(w1, sj, kbx, iqs);
+                        s0[j] += a;
+                        s1[j] += b;
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NTC; ++j) {
+                    const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
+                    if (lane == 0) { put(row0, c0 + j, a); if (two) put(row1, c0 + j, b); }
+                }
+            };
+            switch (cn) {
+                case 1: pass(std::integral_constant<int, 1>{}); break;
+                case 2: pass(std::integral_constant<int, 2>{}); break;
+                case 3: pass(std::integral_constant<int, 3>{}); break;
+                default: pass(std::integral_constant<int, 4>{}); break;
             }
         }
     }
@@ -6455,9 +6559,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
-            case 12: // opt(mi50/gfx906) step13: Q4_K LDS staging, gated by STRATA_Q4K_LDS
-            if (em0 >= 7) native_gu_lds_kernel<12, 0, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            case 12: { // opt(mi50/gfx906) step13/14: Q4_K LDS staging, gated by STRATA_Q4K_LDS
+            static const bool b128 = [] { const char* e = std::getenv("STRATA_Q4K_B128"); return e != nullptr && std::atoi(e) != 0; }();
+            if (b128) {
+                const size_t sh_b128 = (size_t) LDS_NT * (size_t) ((L.n_embd / Fmt<12>::qk) * 16) * sizeof(Q4KB128Slot);
+                native_gu_lds_b128_kernel<<<gl, 256, sh_b128, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            } else if (em0 >= 7) native_gu_lds_kernel<12, 0, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             else native_gu_lds_kernel<12, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            }
             case 16: if (em0 >= 7) native_gu_lds_kernel<16, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<16, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<16, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 18: if (em0 >= 7) native_gu_lds_kernel<18, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<18, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<18, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 21: if (em0 >= 7) native_gu_lds_kernel<21, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<21, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<21, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
