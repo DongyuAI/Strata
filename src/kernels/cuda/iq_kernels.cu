@@ -5769,6 +5769,8 @@ template<> struct GridOf<16> { using T = uint64_t; static constexpr int N = 256;
 template<> struct GridOf<18> { using T = uint32_t; static constexpr int N = 256; __device__ static const T* src() { return iq3xxs_grid; } };
 template<> struct GridOf<21> { using T = uint32_t; static constexpr int N = 512; __device__ static const T* src() { return iq3s_grid; } };
 template<> struct GridOf<23> { using T = uint32_t; static constexpr int N = 1; __device__ static const T* src() { return iq3s_grid; } };   // IQ4_XS: no grid
+// opt(mi50/gfx906) step13: Q4_K has no codebook grid (DotG<12> ignores it); a 1-word dummy satisfies the LDS kernel.
+template<> struct GridOf<12> { using T = uint32_t; static constexpr int N = 1; __device__ static const T* src() { return iq3s_grid; } };
 
 // SG = 1 (mode 6): the signs without byte-SIMD ops, which gfx906 lacks (strata_vcmpne4 / strata_vsub4 unpack to
 // ~12 word ops each).  m = the sign nibble as 0x00/0xff bytes; (g ^ m) is g or -g-1 per byte, so
@@ -5914,6 +5916,13 @@ template<int SG> struct DotG<16, SG> { __device__ static __forceinline__ float f
 
 template<int SG> struct DotG<23, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
                                                       const uint32_t*) { return vec_dot_iq4_xs_q8_1(vbq, bq8_1, kbx, iqs); } };
+
+// opt(mi50/gfx906) step13: Q4_K (gu_type 12) LDS staging.  The production multi kernel reads the q8_1
+// activations straight from global memory for every row; routing Q4_K through native_gu_lds_kernel stages
+// them once into shared memory.  Reuse the exact vec_dot_q4_K_q8_1 (same integers/floats, same order) so the
+// output is bitwise identical to the global-memory path.  This is the prerequisite for ds_read_b128 (step14).
+template<int SG> struct DotG<12, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
+                                                      const uint32_t*) { return vec_dot_q4_K_q8_1(vbq, bq8_1, kbx, iqs); } };
 
 constexpr int LDS_RB = 64;    // gate/up rows per block (4 R2 passes of 16)
 constexpr int LDS_NT = 4;     // entries whose activations sit in LDS at once
@@ -6437,11 +6446,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (g_exp_phase != 2 && !gs_done) {
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool lds_gu = !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
+    // opt(mi50/gfx906) step13: allow Q4_K (12) through the LDS-staged gate/up kernel.  DotG<12> above reuses the
+    // exact vec_dot_q4_K_q8_1, so this is bitwise identical to the global-memory path but stages activations once.
+    const bool lds_q4k = L.gu_type == 12 && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) &&
+                         (std::getenv("STRATA_Q4K_LDS") != nullptr && std::atoi(std::getenv("STRATA_Q4K_LDS")) != 0);
+    const bool lds_gu = !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23 || lds_q4k);
     if (lds_gu) {
         const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
+            case 12: // opt(mi50/gfx906) step13: Q4_K LDS staging, gated by STRATA_Q4K_LDS
+            if (em0 >= 7) native_gu_lds_kernel<12, 0, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else native_gu_lds_kernel<12, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 16: if (em0 >= 7) native_gu_lds_kernel<16, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<16, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<16, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 18: if (em0 >= 7) native_gu_lds_kernel<18, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<18, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<18, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 21: if (em0 >= 7) native_gu_lds_kernel<21, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<21, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<21, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
