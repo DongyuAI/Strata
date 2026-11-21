@@ -3039,9 +3039,23 @@ std::string nibble_refusal(const Options& o) {
             (void) cudaGetLastError();
             return "cannot read CUDA" + std::to_string(d) + "'s properties";
         }
+#if defined(STRATA_HIP_GFX906)
+        // gfx906 port (opt/mi50-gfx906): the 4-bit nibble kernels now build for gfx906 too. HIP
+        // reports gfx906 as compute capability 9.0 (its ISA number), not 6.0. Accept exactly
+        // gfx906 by its architecture name; keep refusing every other device. IQ3_S's decode and
+        // GGUF rebuild use only SWAR + integer ops (no PTX prmt), so they are correct here.
+        {
+            std::string arch(p.gcnArchName);
+            if (const size_t colon = arch.find(':'); colon != std::string::npos) arch.resize(colon);
+            if (arch != "gfx906")
+                return "HIP" + std::to_string(d) + " (" + p.name + ", " + arch +
+                       "): the 4-bit slots are built for gfx906 on AMD";
+        }
+#else
         if (p.major != 6 || p.minor != 0)
             return "CUDA" + std::to_string(d) + " (" + p.name + ") is compute capability " + std::to_string(p.major) + "." +
                    std::to_string(p.minor) + ": the 4-bit slots are for compute capability 6.0 (GP100) only";
+#endif
     }
     if (std::string e = nib::env_conflicts(); !e.empty()) return e;
     if (o.peer_device >= 1) return "--peer-device (its cache holds GGUF blobs)";
