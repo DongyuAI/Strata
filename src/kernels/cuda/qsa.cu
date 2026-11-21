@@ -436,6 +436,11 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 /// One block per query head.  `s` holds the scores, which are then overwritten with the softmax weights.
+// Step15 STRATA_QSA_KVEC: vectorize the FP16 K load in the score dot product.
+// gfx906 microbenchmark (mi50_qsa_kvec_micro2.cu, HD=128 NJ=2051): scalar 0.0763ms,
+// uint2(4 halves) 0.0411ms = 1.857x, uint4 1.005x, __ldg 0.999x -- only 32-bit loads help.
+// The accumulation order (i ascending) is unchanged, so the result is bit-exact.
+template<bool KVEC>
 __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* __restrict__ k_scratch,
                                   const uint16_t* __restrict__ v_scratch, const int32_t* __restrict__ step,
                                  int n_head, int n_head_kv, int head_dim,
@@ -459,10 +464,26 @@ __global__ void qsa_attend_kernel(const float* __restrict__ q, const uint16_t* _
     const float scale = 1.0f / sqrtf((float) head_dim);
     const int lane = d & 31, wid = d >> 5, nwarp = (int) ((blockDim.x + 31) >> 5);
 
+    const float* qrow = q + (size_t) h * head_dim;
     for (long long j = d; j < n_ids; j += blockDim.x) {
         const uint16_t* krow = k_scratch + (j * n_head_kv + kv) * head_dim;
         float acc = 0.0f;
-        for (int i = 0; i < head_dim; ++i) acc += h2f(krow[i]) * q[(size_t) h * head_dim + i];
+        if (KVEC) {
+            // uint2 = 4 halves per 32-bit load.  Only the load width changes; the i-ascending
+            // mul+add sequence is identical to the scalar path, so the dot is bit-exact.
+            int i = 0;
+            for (; i + 4 <= head_dim; i += 4) {
+                const uint2 v = *reinterpret_cast<const uint2*>(krow + i);
+                const uint16_t* hv = reinterpret_cast<const uint16_t*>(&v);
+                acc += h2f(hv[0]) * qrow[i + 0];
+                acc += h2f(hv[1]) * qrow[i + 1];
+                acc += h2f(hv[2]) * qrow[i + 2];
+                acc += h2f(hv[3]) * qrow[i + 3];
+            }
+            for (; i < head_dim; ++i) acc += h2f(krow[i]) * qrow[i];
+        } else {
+            for (int i = 0; i < head_dim; ++i) acc += h2f(krow[i]) * qrow[i];
+        }
         w[j] = acc * scale;
     }
     __syncthreads();
@@ -680,16 +701,31 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
                          (long long) max_ids, smem, max_shared);
             std::exit(1);
         }
-        const cudaError_t e =
-            cudaFuncSetAttribute(qsa_attend_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaError_t e =
+            cudaFuncSetAttribute(qsa_attend_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "qsa: qsa_attend: shared opt-in: %s\n", cudaGetErrorString(e));
+            std::fprintf(stderr, "qsa: qsa_attend: shared opt-in(false): %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        e = cudaFuncSetAttribute(qsa_attend_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "qsa: qsa_attend: shared opt-in(true): %s\n", cudaGetErrorString(e));
             std::exit(1);
         }
         s_configured = smem;
     }
-    qsa_attend_kernel<<<(unsigned) s.n_head, (unsigned) s.head_dim, smem, (cudaStream_t) stream>>>(
-        q, k_scratch, v_scratch, step, (int) s.n_head, (int) s.n_head_kv, (int) s.head_dim, attn, weights);
+    // Step15 STRATA_QSA_KVEC: uint2 K loads (bit-exact, gfx906 micro 1.857x on the score dot).
+    static const bool kvec = [] {
+        const char* e = std::getenv("STRATA_QSA_KVEC");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    if (kvec) {
+        qsa_attend_kernel<true><<<(unsigned) s.n_head, (unsigned) s.head_dim, smem, (cudaStream_t) stream>>>(
+            q, k_scratch, v_scratch, step, (int) s.n_head, (int) s.n_head_kv, (int) s.head_dim, attn, weights);
+    } else {
+        qsa_attend_kernel<false><<<(unsigned) s.n_head, (unsigned) s.head_dim, smem, (cudaStream_t) stream>>>(
+            q, k_scratch, v_scratch, step, (int) s.n_head, (int) s.n_head_kv, (int) s.head_dim, attn, weights);
+    }
     check_launch("qsa_attend");
     if (stream == nullptr) check_sync("qsa_attend");
 }
